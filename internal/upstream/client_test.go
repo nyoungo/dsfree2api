@@ -144,6 +144,32 @@ func TestNoFallbackAfterContentStarted(t *testing.T) {
 	}
 }
 
+func TestQuotaObserverFiresOncePerSiteBeforeFailover(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Upstream.AutoRefresh = false
+	c := New(cfg, nil, nil, nil)
+	c.chatOnceOverride = func(ctx context.Context, site config.Site, modelID string, model config.Model,
+		prompt string, route Route, info *ServeInfo, yield func(Event) error) error {
+		if site.Code == "de" {
+			return newQuota(`sse quota exhausted: {"quota_notice":{}}`)
+		}
+		yield(Event{Kind: KindDelta, Value: "ok"})
+		return nil
+	}
+	var fired []string
+	c.SetQuotaObserver(func(site, model, route string, err error) {
+		fired = append(fired, site+"|"+model+"|"+route)
+	})
+
+	if err := c.Chat(context.Background(), "deepseek-v4-flash-de", "hi", &ServeInfo{},
+		func(ev Event) error { return nil }); err != nil {
+		t.Fatalf("chat should succeed via cross-site failover: %v", err)
+	}
+	if len(fired) != 1 || fired[0] != "de|deepseek-v4-flash-de|primary" {
+		t.Fatalf("quota observer events = %v, want [de|deepseek-v4-flash-de|primary]", fired)
+	}
+}
+
 func TestQuotaNoticeTriggersQuotaError(t *testing.T) {
 	payload := map[string]any{
 		"error": "Dein heutiges Guthaben von 10.000 Token (V4-Pro) ist aufgebraucht.",

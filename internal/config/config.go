@@ -126,6 +126,53 @@ func (t Turnstile) WarmCheckValue() int {
 	return n
 }
 
+// Quota sentinel defaults: polling interval and the remaining-quota warning
+// threshold (share of the daily free limit left).
+const (
+	DefaultQuotaCheckSeconds = 300
+	DefaultQuotaWarnRatio    = 0.2
+)
+
+// QuotaWatch configures the guest-token balance sentinel: it polls each
+// site's balance endpoint with the pooled session (same egress and cookies as
+// chat) and reports remaining daily quota to the console and logs.
+type QuotaWatch struct {
+	Enabled      bool    `toml:"enabled" json:"enabled"`
+	CheckSeconds int     `toml:"check_seconds" json:"check_seconds"`
+	WarnRatio    float64 `toml:"warn_ratio" json:"warn_ratio"`
+}
+
+// CheckSecondsValue normalizes check_seconds (default 300s, clamped 30–3600).
+func (q QuotaWatch) CheckSecondsValue() int {
+	n := q.CheckSeconds
+	if n <= 0 {
+		return DefaultQuotaCheckSeconds
+	}
+	if n < 30 {
+		return 30
+	}
+	if n > 3600 {
+		return 3600
+	}
+	return n
+}
+
+// WarnRatioValue normalizes warn_ratio: remaining/limit below this fraction
+// raises a "quota low" warning (default 20%, clamped 5–95%).
+func (q QuotaWatch) WarnRatioValue() float64 {
+	r := q.WarnRatio
+	if r <= 0 {
+		return DefaultQuotaWarnRatio
+	}
+	if r < 0.05 {
+		return 0.05
+	}
+	if r > 0.95 {
+		return 0.95
+	}
+	return r
+}
+
 type Site struct {
 	Code         string `toml:"-"`
 	BaseURL      string `toml:"base_url" json:"base_url"`
@@ -214,6 +261,11 @@ type Config struct {
 	} `toml:"proxy" json:"proxy"`
 
 	ProxyPool ProxyPool `toml:"proxypool" json:"proxypool"`
+
+	// Quota is the balance sentinel: it polls each site's guest-token balance
+	// so the console shows how much daily free quota is left.
+	Quota QuotaWatch `toml:"quota" json:"quota"`
+
 	Upstream struct {
 		Timeout             float64 `toml:"timeout" json:"timeout"`
 		StreamTimeout       float64 `toml:"stream_timeout" json:"stream_timeout"`

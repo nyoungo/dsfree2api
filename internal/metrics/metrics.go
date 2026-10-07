@@ -46,9 +46,11 @@ type modelStats struct {
 }
 
 type siteStats struct {
-	Requests int64 `json:"requests"`
-	Errors   int64 `json:"errors"`
-	Quota    int64 `json:"quota_exhausted"`
+	Requests  int64 `json:"requests"`
+	Errors    int64 `json:"errors"`
+	Quota     int64 `json:"quota_exhausted"`
+	Prompt    int64 `json:"prompt_tokens"`
+	Completed int64 `json:"completion_tokens"`
 }
 
 type dayStats struct {
@@ -228,6 +230,8 @@ func (r *Recorder) Record(rec Record) {
 			r.sites[rec.Site] = s
 		}
 		s.Requests++
+		s.Prompt += int64(rec.PromptTokens)
+		s.Completed += int64(rec.CompletionTokens)
 		if rec.Status == StatusError || rec.Status == StatusEmpty {
 			s.Errors++
 		}
@@ -262,6 +266,45 @@ func (r *Recorder) Record(rec Record) {
 			r.latency = r.latency[len(r.latency)-maxLatency:]
 		}
 	}
+}
+
+// SiteTotals is the cumulative per-site usage snapshot; it sizes a quota
+// exhaustion — how many tokens had flowed before the site cut us off.
+type SiteTotals struct {
+	Requests         int64 `json:"requests"`
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	Quota            int64 `json:"quota_exhausted"`
+}
+
+// SiteTotals returns the cumulative usage attributed to one site so far.
+// Totals persist across restarts through metrics.json.
+func (r *Recorder) SiteTotals(site string) SiteTotals {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.sites[site]
+	if s == nil {
+		return SiteTotals{}
+	}
+	return SiteTotals{
+		Requests:         s.Requests,
+		PromptTokens:     s.Prompt,
+		CompletionTokens: s.Completed,
+		Quota:            s.Quota,
+	}
+}
+
+// IncSiteQuota counts one site-side quota exhaustion that may never surface as
+// a failed request (e.g. swallowed by cross-site failover).
+func (r *Recorder) IncSiteQuota(site string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.sites[site]
+	if s == nil {
+		s = &siteStats{}
+		r.sites[site] = s
+	}
+	s.Quota++
 }
 
 func (r *Recorder) Snapshot() any {

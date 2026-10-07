@@ -22,6 +22,7 @@ import (
 	"github.com/nyoungo/dsfree2api/internal/logfile"
 	"github.com/nyoungo/dsfree2api/internal/metrics"
 	"github.com/nyoungo/dsfree2api/internal/proxypool"
+	"github.com/nyoungo/dsfree2api/internal/quota"
 	"github.com/nyoungo/dsfree2api/internal/turnstile"
 	"github.com/nyoungo/dsfree2api/internal/upstream"
 )
@@ -91,14 +92,35 @@ func main() {
 
 	up := upstream.New(cfg, ts, logger, pool)
 
+	// Quota watchdog: every site-side quota exhaustion is logged together with
+	// the tokens spent on that site so far — including ones swallowed by
+	// cross-site failover, so the cutoff is recorded rather than hidden.
+	up.SetQuotaObserver(func(site, model, route string, err error) {
+		met.IncSiteQuota(site)
+		t := met.SiteTotals(site)
+		logger.Warn("site quota exhausted",
+			"site", site, "model", model, "route", route, "error", err.Error(),
+			"site_requests", t.Requests,
+			"site_prompt_tokens", t.PromptTokens,
+			"site_completion_tokens", t.CompletionTokens,
+			"site_quota_events", t.Quota)
+	})
+
 	// Cookie pool: keep one verified session per site × route ahead of time,
 	// so API requests never wait for a solve. No-op unless warm_enabled.
 	warmCtx, warmCancel := context.WithCancel(context.Background())
 	defer warmCancel()
 	ts.StartWarmer(warmCtx, func() []turnstile.WarmTarget { return warmTargets(cfg, up, pool) })
 
+	// Quota sentinel: poll the sites' guest-token balances for the console
+	// and the "quota low" alarms. No-op unless [quota].enabled.
+	quotaCtx, quotaCancel := context.WithCancel(context.Background())
+	defer quotaCancel()
+	quotaWatch := quota.New(cfg, logger, ts, pool)
+	quotaWatch.Start(quotaCtx)
+
 	apiSrv := api.New(cfg, up, met, logs, ts, logger)
-	adminSrv := admin.New(cfg, up, met, logs, ts, logger, pool)
+	adminSrv := admin.New(cfg, up, met, logs, ts, logger, pool, quotaWatch)
 
 	mainAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	mainHTTP := &http.Server{

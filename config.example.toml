@@ -117,6 +117,14 @@ warm_enabled = false
 warm_ratio = 0.3            # 剩余 TTL 低于该比例（0.05–0.95）时触发预热
 warm_check_seconds = 60     # 后台巡检间隔秒数（5–3600）
 
+# ── 配额哨兵（站点免费额度实时监控）──────────────
+# 用与聊天相同的出口 Cookie 定期查询站点余额接口（每日免费额度），结果
+# 写入日志与后台 /api/overview 的 quota 区域；剩余低于 warn_ratio 时告警。
+[quota]
+enabled = false
+check_seconds = 300
+warn_ratio = 0.2
+
 [runtime]
 data_dir = "./data"
 

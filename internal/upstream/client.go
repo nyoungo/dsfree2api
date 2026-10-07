@@ -73,6 +73,11 @@ type Client struct {
 	lastWarnMsg string
 	lastWarnAt  time.Time
 
+	// quotaObserver, when set, is notified on the first site-side quota
+	// exhaustion of each request — including ones hidden by cross-site
+	// failover.
+	quotaObserver func(site, model, route string, err error)
+
 	// chatOnceOverride is a test seam; nil in production.
 	chatOnceOverride func(ctx context.Context, site config.Site, modelID string, model config.Model,
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error
@@ -92,6 +97,13 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger, pool RouteS
 		gates:     map[string]chan struct{}{},
 		quotaCool: map[string]time.Time{},
 	}
+}
+
+// SetQuotaObserver registers a callback that fires whenever a site reports
+// quota exhaustion, even when cross-site failover later succeeds and the error
+// would otherwise never surface. Set it before serving requests.
+func (c *Client) SetQuotaObserver(fn func(site, model, route string, err error)) {
+	c.quotaObserver = fn
 }
 
 // Routes returns the primary proxy followed by the fallbacks, deduplicated.
@@ -405,6 +417,7 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 		return errf("site %s is disabled", model.Site)
 	}
 	routes := c.routesFor(site.Code)
+	quotaNotified := false
 
 	var lastErr error
 	sawQuota := false
@@ -426,6 +439,10 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 				return nil
 			}
 			lastErr = err
+			if isQuota(err) && !quotaNotified && c.quotaObserver != nil {
+				quotaNotified = true
+				c.quotaObserver(site.Code, modelID, route.Name, err)
+			}
 			if contentStarted(err) {
 				return AsUpstream(err)
 			}

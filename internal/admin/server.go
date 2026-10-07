@@ -16,6 +16,7 @@ import (
 	"github.com/nyoungo/dsfree2api/internal/logbuf"
 	"github.com/nyoungo/dsfree2api/internal/metrics"
 	"github.com/nyoungo/dsfree2api/internal/proxypool"
+	"github.com/nyoungo/dsfree2api/internal/quota"
 	"github.com/nyoungo/dsfree2api/internal/turnstile"
 	"github.com/nyoungo/dsfree2api/internal/upstream"
 )
@@ -33,6 +34,7 @@ type Server struct {
 	logs  *logbuf.Buffer
 	ts    *turnstile.Solver
 	pool  *proxypool.Manager
+	quota *quota.Watcher
 	log   *slog.Logger
 	start time.Time
 
@@ -41,7 +43,7 @@ type Server struct {
 	password string
 }
 
-func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *logbuf.Buffer, ts *turnstile.Solver, log *slog.Logger, pool *proxypool.Manager) *Server {
+func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *logbuf.Buffer, ts *turnstile.Solver, log *slog.Logger, pool *proxypool.Manager, qw *quota.Watcher) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -52,7 +54,7 @@ func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *l
 		generated = true
 	}
 	s := &Server{
-		cfg: cfg, up: up, met: met, logs: logs, ts: ts, pool: pool, log: log,
+		cfg: cfg, up: up, met: met, logs: logs, ts: ts, pool: pool, quota: qw, log: log,
 		start: time.Now(), tokens: map[string]time.Time{}, password: pw,
 	}
 	if generated {
@@ -207,6 +209,11 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	if s.pool != nil {
 		poolStatus = s.pool.Status()
 	}
+	var quotaStatus any
+	if s.quota != nil {
+		quotaStatus = s.quota.Snapshot()
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"metrics":   s.met.Snapshot(),
 		"models":    models,
@@ -214,6 +221,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 		"proxy":     proxyCfg,
 		"turnstile": map[string]any{"config": turnstileCfg, "status": s.ts.Status(siteCodes), "history": s.ts.History(), "pool": s.ts.PoolStatus()},
 		"proxypool": poolStatus,
+		"quota":     quotaStatus,
 		"keys":      keys,
 		"cache":     map[string]any{"chat_config_entries": s.up.ConfigCacheSize(), "routes": routeList(s.up)},
 		"system": map[string]any{
