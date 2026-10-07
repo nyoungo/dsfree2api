@@ -22,7 +22,6 @@ Go 实现，编译为**单个静态二进制**，无运行时依赖；内置 **W
 - [API 用法](#api-用法)
 - [Web 管理台](#web-管理台)
 - [环境变量](#环境变量)
-- [与 Python 版的差异](#与-python-版的差异)
 - [架构](#架构)
 - [开发](#开发)
 - [免责声明](#免责声明)
@@ -32,7 +31,7 @@ Go 实现，编译为**单个静态二进制**，无运行时依赖；内置 **W
 ## 功能特性
 
 - **多格式对话接口**：`POST /v1/chat/completions`（OpenAI，流式 / 非流式）、`POST /v1/responses`（OpenAI Responses）、`POST /v1/messages`（Anthropic Messages）、`GET /v1/models`、`GET /health`
-- **Tool Calling**：三个对话端点均支持 `tools` / `tool_choice`，模型以 JSON 输出 tool_calls，自动回填到响应（`tool_calls` / `function_call` / `tool_use`）
+- **Tool Calling**：三个对话端点均支持 `tools` / `tool_choice`，模型以 JSON 输出 tool_calls，自动回填到响应（`tool_calls` / `function_call` / `tool_use`）；回复被上游输出上限截断时自动多轮续写拼接（`continue_rounds`）
 - **三站点聚合**：单站点配额耗尽自动切换到其他站点的同款模型
 - **代理线路**：主线路 + 多条备用线路，支持 `http://` `https://` `socks5://`；slow-start 检测 + 失败降级 + 流中失败不重放
 - **Turnstile 自动突破**：三种 Token 获取方式 — 求解服务 API（`provider="api"`）、本地浏览器自动求解（`provider="browser"`，CDP 直连 Chrome/Edge，无需 Playwright/Docker）、手动导入 Cookie（`provider="manual"`）；结果按「代理线路 × 站点」缓存，TTL 过期自动重解
@@ -139,7 +138,7 @@ dsfree2api -config config.toml -check
 | `[admin]` | 管理台 `enabled` / `host` / `port` / `password`（留空启动时生成随机密码） |
 | `[limits]` | `max_concurrent_per_site` 每站点并发、`rate_per_minute` 每 Key 每分钟限流（0 = 不限） |
 | `[proxy]` | `url` 主线路、`fallback_urls` 备用线路、`slow_start_seconds` 首事件超时 |
-| `[upstream]` | 超时、配置缓存 TTL、会话自动刷新、`cross_site_failover` 跨站切换 |
+| `[upstream]` | 超时、配置缓存 TTL、会话自动刷新、`cross_site_failover` 跨站切换、`continue_rounds` 工具调用截断续写轮数 |
 | `[turnstile]` | **默认 `enabled = false` 且不内置任何求解服务**；`provider` 三选一：`api`（填 `api_url` / `api_key`）、`browser`（填 `browser_path` 指向本机 Chrome/Edge）、`manual`（只用控制台导入的 Cookie），另有 Cookie TTL、重试次数 |
 | `[sites.*]` | 三个站点的 `base_url` / `ajax_url` / `sitekey` / `language` |
 | `[models.*]` | 模型到 `site` + `upstream_id` + `bot_id` / `post_id` 的映射 |
@@ -293,30 +292,6 @@ curl http://127.0.0.1:8000/v1/messages \
 | `TURNSTILE_BROWSER_PATH` | 浏览器模式的 Chrome / Edge 可执行文件路径 | — |
 | `ADMIN_ENABLED` / `ADMIN_HOST` / `ADMIN_PORT` / `ADMIN_PASSWORD` | 管理台 | `true` / `127.0.0.1` / `8001` |
 | `DATA_DIR` | 统计等运行时数据目录 | `./data` |
-
----
-
-## 与 Python 版的差异
-
-功能对齐 `deepseek-fr-2api-main`（Python/FastAPI 版），并做了以下修复与增强：
-
-**修复**
-
-- 流式 `tool_calls` 仅在请求带 `tools` 时缓冲后再下发，避免内容重复
-- `/v1/responses` 流式错误发 `response.failed`，不再假报 `completed`
-- 会话标记识别只匹配明确 marker，不再误判裸 `"nonce"` 字段
-- `temperature` / `max_tokens` / `stop` / `response_format` 以 prompt 尾部约束下发
-- 空 role 不再导致 prompt 构建 panic
-
-**增强**
-
-- 站点配额耗尽跨站切换（`cross_site_failover`）
-- 每站点并发闸门 + 每 Key 每分钟限流
-- 启动期配置校验（`-check`），按 provider 检查 `api_url` / `api_key` 或 `browser_path`，缺失直接报错而非运行时失败
-- 统计持久化（`data/metrics.json`）、实时日志 SSE、对话调试页
-- `POST /v1/messages` Anthropic Messages 格式（流式 / 非流式 / `tool_use`），`/v1/responses` 支持 `tools` → `function_call`，多轮 tool 结果回填
-- `Chat` / `Responses` / `Messages` / `Models` / 代理与 Turnstile 的单元测试
-- 单二进制部署，无 Python / uv / libcurl 依赖
 
 ---
 

@@ -66,15 +66,16 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.met.IncInFlight(1)
 	defer s.met.IncInFlight(-1)
 
+	cont := continuationFor(tools, messages, s.continueRounds())
 	if req.Stream {
-		s.streamMessages(ctx, w, req, prompt, site, tools)
+		s.streamMessages(ctx, w, req, prompt, site, tools, cont)
 		return
 	}
-	s.completeMessages(ctx, w, req, prompt, site, tools)
+	s.completeMessages(ctx, w, req, prompt, site, tools, cont)
 }
 
-func (s *Server) completeMessages(ctx context.Context, w http.ResponseWriter, req anthropic.Request, prompt, site string, tools []openai.ToolDef) {
-	out := s.collect(ctx, req.Model, prompt, site)
+func (s *Server) completeMessages(ctx context.Context, w http.ResponseWriter, req anthropic.Request, prompt, site string, tools []openai.ToolDef, cont openai.ContinuationFunc) {
+	out := s.collect(ctx, req.Model, prompt, site, cont)
 	if out.err != nil {
 		writeAnthropicUpstreamError(w, out.err)
 		return
@@ -99,7 +100,7 @@ func (s *Server) completeMessages(ctx context.Context, w http.ResponseWriter, re
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req anthropic.Request, prompt, site string, tools []openai.ToolDef) {
+func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req anthropic.Request, prompt, site string, tools []openai.ToolDef, cont openai.ContinuationFunc) {
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -155,20 +156,18 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 	var text strings.Builder
 	var firstDelta time.Time
 
-	err := s.up.Chat(ctx, req.Model, prompt, info, func(ev upstream.Event) error {
-		if ev.Kind != upstream.KindDelta || ev.Value == "" {
-			return nil
-		}
+	err := s.chatWithContinue(ctx, req.Model, prompt, cont, info, func() {
 		if firstDelta.IsZero() {
 			firstDelta = time.Now()
 		}
-		text.WriteString(ev.Value)
+	}, func(seg string) error {
+		text.WriteString(seg)
 		if buffered {
 			return nil
 		}
 		return writeEvent("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": 0,
-			"delta": map[string]any{"type": "text_delta", "text": ev.Value},
+			"delta": map[string]any{"type": "text_delta", "text": seg},
 		})
 	})
 

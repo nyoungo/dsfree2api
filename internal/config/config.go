@@ -110,6 +110,7 @@ type Config struct {
 		RetryBackoffSeconds float64 `toml:"retry_backoff_seconds" json:"retry_backoff_seconds"`
 		UserAgent           string  `toml:"user_agent" json:"user_agent"`
 		CrossSiteFailover   bool    `toml:"cross_site_failover" json:"cross_site_failover"`
+		ContinueRounds      int     `toml:"continue_rounds" json:"continue_rounds"`
 	} `toml:"upstream" json:"upstream"`
 
 	Runtime struct {
@@ -198,6 +199,7 @@ func newConfig() *Config {
 	c.Upstream.RetryBackoffSeconds = 1
 	c.Upstream.UserAgent = DefaultUserAgent
 	c.Upstream.CrossSiteFailover = true
+	c.Upstream.ContinueRounds = 20
 	c.Runtime.DataDir = "./data"
 	c.Turnstile = DefaultTurnstile()
 	c.Sites = DefaultSites(c.Turnstile.SiteKey)
@@ -297,6 +299,7 @@ func (c *Config) applyDefaults(md *toml.MetaData) {
 	if md == nil {
 		c.Turnstile.Enabled = true
 		c.Upstream.AutoRefresh = true
+		c.Upstream.ContinueRounds = 20
 		for _, s := range c.Sites {
 			s.Enabled = true
 		}
@@ -418,6 +421,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Upstream.StreamTimeout <= 0 {
 		return errors.New("upstream.stream_timeout must be > 0")
+	}
+	if c.Upstream.ContinueRounds < 0 {
+		c.Upstream.ContinueRounds = 0
 	}
 	if err := c.validateTurnstile(); err != nil {
 		return err

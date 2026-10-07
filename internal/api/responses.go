@@ -58,11 +58,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	if req.Stream {
-		s.streamResponses(ctx, w, req, prompt, site, tools)
+		s.streamResponses(ctx, w, req, prompt, site, tools, continuationFor(tools, messages, s.continueRounds()))
 		return
 	}
 
-	out := s.collect(ctx, req.Model, prompt, site)
+	out := s.collect(ctx, req.Model, prompt, site, continuationFor(tools, messages, s.continueRounds()))
 	if out.err != nil {
 		writeUpstreamError(w, out.err)
 		return
@@ -120,7 +120,7 @@ func responseOutputItems(text string, calls []openai.ToolCall) []map[string]any 
 	return output
 }
 
-func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req openai.ResponsesRequest, prompt, site string, tools []openai.ToolDef) {
+func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req openai.ResponsesRequest, prompt, site string, tools []openai.ToolDef, cont openai.ContinuationFunc) {
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -158,18 +158,16 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 	var text strings.Builder
 	var firstDelta time.Time
 
-	err := s.up.Chat(ctx, req.Model, prompt, info, func(ev upstream.Event) error {
-		if ev.Kind != upstream.KindDelta || ev.Value == "" {
-			return nil
-		}
+	err := s.chatWithContinue(ctx, req.Model, prompt, cont, info, func() {
 		if firstDelta.IsZero() {
 			firstDelta = time.Now()
 		}
-		text.WriteString(ev.Value)
+	}, func(seg string) error {
+		text.WriteString(seg)
 		if buffered {
 			return nil
 		}
-		return write(map[string]any{"type": "response.output_text.delta", "delta": ev.Value})
+		return write(map[string]any{"type": "response.output_text.delta", "delta": seg})
 	})
 
 	duration := time.Since(start)

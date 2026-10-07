@@ -43,6 +43,9 @@ retry_backoff_seconds = 1.0
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 # 本站点配额耗尽时自动切换到其他站点的同款模型。
 cross_site_failover = true
+# 站点对单次回复有约 1k token 的硬上限，大参数的工具调用 JSON 会被截断。
+# 自动向上游追加「续写」轮次把 JSON 拼完整；0 = 关闭。
+continue_rounds = 20
 
 [turnstile]
 # 默认关闭，且不内置任何求解服务。Token 获取方式三选一（provider）：

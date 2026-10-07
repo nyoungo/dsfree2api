@@ -64,11 +64,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.met.IncInFlight(1)
 	defer s.met.IncInFlight(-1)
 
+	cont := continuationFor(req.Tools, req.Messages, s.continueRounds())
 	if req.Stream {
-		s.streamChat(ctx, w, req, prompt, site)
+		s.streamChat(ctx, w, req, prompt, site, cont)
 		return
 	}
-	s.completeChat(ctx, w, req, prompt, site)
+	s.completeChat(ctx, w, req, prompt, site, cont)
 }
 
 // chatOutcome is the result of replaying one upstream conversation.
@@ -84,20 +85,21 @@ type chatOutcome struct {
 }
 
 // collect runs a full (non-streaming) conversation against the upstream site
-// and records metrics for it.
-func (s *Server) collect(ctx context.Context, modelID, prompt, site string) chatOutcome {
+// and records metrics for it. When cont is non-nil the reply is automatically
+// continued across extra upstream turns until a truncated tool-call JSON
+// closes (see openai.RunContinued).
+func (s *Server) collect(ctx context.Context, modelID, prompt, site string, cont openai.ContinuationFunc) chatOutcome {
 	start := time.Now()
 	info := &upstream.ServeInfo{}
 	var text strings.Builder
 	var firstDelta time.Time
 
-	err := s.up.Chat(ctx, modelID, prompt, info, func(ev upstream.Event) error {
-		if ev.Kind == upstream.KindDelta && ev.Value != "" {
-			if firstDelta.IsZero() {
-				firstDelta = time.Now()
-			}
-			text.WriteString(ev.Value)
+	err := s.chatWithContinue(ctx, modelID, prompt, cont, info, func() {
+		if firstDelta.IsZero() {
+			firstDelta = time.Now()
 		}
+	}, func(seg string) error {
+		text.WriteString(seg)
 		return nil
 	})
 
@@ -132,8 +134,8 @@ func (s *Server) collect(ctx context.Context, modelID, prompt, site string) chat
 	}
 }
 
-func (s *Server) completeChat(ctx context.Context, w http.ResponseWriter, req openai.ChatCompletionRequest, prompt, site string) {
-	out := s.collect(ctx, req.Model, prompt, site)
+func (s *Server) completeChat(ctx context.Context, w http.ResponseWriter, req openai.ChatCompletionRequest, prompt, site string, cont openai.ContinuationFunc) {
+	out := s.collect(ctx, req.Model, prompt, site, cont)
 	if out.err != nil {
 		writeUpstreamError(w, out.err)
 		return
@@ -175,7 +177,7 @@ func finishReason(calls []openai.ToolCall) string {
 	return "stop"
 }
 
-func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req openai.ChatCompletionRequest, prompt, site string) {
+func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req openai.ChatCompletionRequest, prompt, site string, cont openai.ContinuationFunc) {
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -221,18 +223,16 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
 	s.met.IncInFlight(1)
 	defer s.met.IncInFlight(-1)
 
-	err := s.up.Chat(ctx, req.Model, prompt, info, func(ev upstream.Event) error {
-		if ev.Kind != upstream.KindDelta || ev.Value == "" {
-			return nil
-		}
+	err := s.chatWithContinue(ctx, req.Model, prompt, cont, info, func() {
 		if firstDelta.IsZero() {
 			firstDelta = time.Now()
 		}
-		text.WriteString(ev.Value)
+	}, func(seg string) error {
+		text.WriteString(seg)
 		if buffered {
 			return nil
 		}
-		return write(chunk(openai.ChoiceDelta{Content: ev.Value}, nil))
+		return write(chunk(openai.ChoiceDelta{Content: seg}, nil))
 	})
 
 	duration := time.Since(start)
