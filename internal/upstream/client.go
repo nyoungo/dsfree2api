@@ -33,6 +33,19 @@ func (r Route) Key() string {
 	return r.Proxy
 }
 
+// RouteCandidate is one egress route supplied by the proxy pool.
+type RouteCandidate struct {
+	Name  string
+	Proxy string
+}
+
+// RouteSource resolves per-site route candidates and records request
+// outcomes. Implemented by proxypool.Manager; nil when the pool is unused.
+type RouteSource interface {
+	Candidates(site string) []RouteCandidate
+	Report(proxy string, ok bool)
+}
+
 type chatConfig struct {
 	BotID     int
 	PostID    int
@@ -42,9 +55,10 @@ type chatConfig struct {
 }
 
 type Client struct {
-	cfg *config.Config
-	ts  *turnstile.Solver
-	log *slog.Logger
+	cfg  *config.Config
+	ts   *turnstile.Solver
+	log  *slog.Logger
+	pool RouteSource
 
 	stateMu  sync.Mutex
 	chatCfg  map[string]chatConfig
@@ -64,7 +78,7 @@ type Client struct {
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error
 }
 
-func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger) *Client {
+func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger, pool RouteSource) *Client {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -72,6 +86,7 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger) *Client {
 		cfg:       cfg,
 		ts:        ts,
 		log:       log,
+		pool:      pool,
 		chatCfg:   map[string]chatConfig{},
 		cfgLocks:  map[string]*sync.Mutex{},
 		gates:     map[string]chan struct{}{},
@@ -239,6 +254,40 @@ func (c *Client) logCacheReject(site, modelID, prompt string) {
 		"head", strconv.Quote(head), "tail", strconv.Quote(tail))
 }
 
+// routesFor returns the ordered candidate routes for one site: proxy-pool
+// candidates first (sticky, health filtered), then the global primary and
+// fallback lines as the safety net.
+func (c *Client) routesFor(siteCode string) []Route {
+	out := make([]Route, 0, 4)
+	seen := map[string]bool{}
+	add := func(r Route) {
+		key := r.Key()
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+	if c.pool != nil {
+		for _, cand := range c.pool.Candidates(siteCode) {
+			add(Route{Name: cand.Name, Proxy: cand.Proxy})
+		}
+	}
+	for _, r := range c.Routes() {
+		add(r)
+	}
+	return out
+}
+
+// poolReport feeds a route outcome back to the proxy pool; it is a no-op for
+// global routes and the direct connection.
+func (c *Client) poolReport(proxy string, ok bool) {
+	if c.pool == nil || proxy == "" {
+		return
+	}
+	c.pool.Report(proxy, ok)
+}
+
 // Chat streams the prompt through the upstream site, honouring route
 // failover, slow-start detection, session refresh and cross-site failover.
 func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *ServeInfo, yield func(Event) error) error {
@@ -355,7 +404,7 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 	if !site.Enabled {
 		return errf("site %s is disabled", model.Site)
 	}
-	routes := c.Routes()
+	routes := c.routesFor(site.Code)
 
 	var lastErr error
 	sawQuota := false
@@ -369,6 +418,7 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 					c.clearQuotaCool(site.Code)
 					c.probeBalanceAsync(site, model, route)
 				}
+				c.poolReport(route.Proxy, true)
 				return nil
 			}
 			lastErr = err
@@ -397,6 +447,11 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 			// the caller can fail over to a mirror right away.
 			if isCacheEmptyProblem(err) {
 				return AsUpstream(err)
+			}
+			// Quota/session failures are site-side, not proxy-side — do not
+			// blame the egress endpoint for them.
+			if !isQuota(err) && !isSession(err) {
+				c.poolReport(route.Proxy, false)
 			}
 			failed = append(failed, route)
 			c.logUpstreamErr(site.Code, modelID, attempt, route, err)

@@ -35,6 +35,7 @@ Go 实现，编译为**单个静态二进制**，无运行时依赖；内置 **W
 - **三站点聚合**：单站点每日额度耗尽自动切换到其他站点的同款模型，额度耗尽的站点临时降级 10 分钟
 - **站点额度管理**：额度按访客身份按日计算，控制台站点卡片可一键查询当前额度、重置访客身份（等同新开隐私窗口、额度即刻回满）；请求撞额度时也会自动轮换访客身份恢复，无需重新求解
 - **代理线路**：主线路 + 多条备用线路，支持 `http://` `https://` `socks5://`；slow-start 检测 + 失败降级 + 流中失败不重放
+- **代理池**：Xray 核心（分享链接 / 订阅 / `ip:port` 端点；核心可自动下载）+ 粘性选路 + 后台健康探测；每个站点可绑定独立出口，Turnstile 求解与请求共用同一出口
 - **Turnstile 自动突破**：三种 Token 获取方式 — 求解服务 API（`provider="api"`）、本地浏览器自动求解（`provider="browser"`，CDP 直连 Chrome/Edge，无需 Playwright/Docker）、手动导入 Cookie（`provider="manual"`）；结果按「代理线路 × 站点」缓存，TTL 过期自动重解
 - **会话自愈**：nonce / data-config 缓存 + 配额耗尽 / 验证失败时自动刷新重试
 - **Web 管理台**：仪表盘、模型与站点、API Key、代理线路、Turnstile、对话调试、实时日志、设置
@@ -139,9 +140,10 @@ dsfree2api -config config.toml -check
 | `[admin]` | 管理台 `enabled` / `host` / `port` / `password`（留空启动时生成随机密码） |
 | `[limits]` | `max_concurrent_per_site` 每站点并发、`rate_per_minute` 每 Key 每分钟限流（0 = 不限） |
 | `[proxy]` | `url` 主线路、`fallback_urls` 备用线路、`slow_start_seconds` 首事件超时 |
+| `[proxypool]` | 代理池总开关、健康检查间隔 / 超时 / URL、裸 `ip:port` 默认协议、Xray 路径 / 版本 / 自动下载；`[proxypool.entries.*]` 手动节点（分享链接或端点）、`[proxypool.subscriptions.*]` 订阅自动拉取 |
 | `[upstream]` | 超时、配置缓存 TTL、会话自动刷新、`cross_site_failover` 跨站切换、`continue_rounds` 工具调用截断续写轮数（0 = 不续写、直接截断补全） |
 | `[turnstile]` | **默认 `enabled = false` 且不内置任何求解服务**；`provider` 三选一：`api`（填 `api_url` / `api_key`）、`browser`（填 `browser_path` 指向本机 Chrome/Edge）、`manual`（只用控制台导入的 Cookie），另有 Cookie TTL、重试次数 |
-| `[sites.*]` | 三个站点的 `base_url` / `ajax_url` / `sitekey` / `language` |
+| `[sites.*]` | 三个站点的 `base_url` / `ajax_url` / `sitekey` / `language` / `proxies`（站点级出口绑定，按顺序粘性选路） |
 | `[models.*]` | 模型到 `site` + `upstream_id` + `bot_id` / `post_id` 的映射 |
 
 ### Turnstile 说明
@@ -265,7 +267,7 @@ curl http://127.0.0.1:8000/v1/messages \
 | 仪表盘 | 请求数 / 错误 / Token / P50·P95、模型用量、站点状态（含 Cookie TTL 进度条）、最近请求 |
 | 模型与站点 | 编辑标签、路径、bot_id/post_id，启停模型与站点，修改站点 URL / 语言 |
 | API Key | 生成 / 删除 / 复制下游 key，立即写回配置 |
-| 代理线路 | 主线路、备用线路增删、连通性测试、slow-start / 并发 / 限流 / 跨站切换 |
+| 代理线路 | 主线路、备用线路增删、连通性测试、slow-start / 并发 / 限流 / 跨站切换、代理池（节点 / 订阅 / 每站点绑定 / Xray 核心状态） |
 | Turnstile | 三种 Token 获取方式的模式面板（求解服务 API / 本地浏览器自动获取 / 手动导入 Cookie）、各站 Cookie 状态与 TTL、强制刷新、求解历史 |
 | 对话调试 | 选模型 / 系统提示 / tools JSON，流式或非流式，带连接计时与取消 |
 | 实时日志 | 级别过滤 + SSE 实时推送 |
@@ -302,6 +304,7 @@ curl http://127.0.0.1:8000/v1/messages \
 cmd/dsfree2api        入口：配置加载、日志、双 HTTP server、优雅退出
 internal/config       TOML 结构 + 默认值 + env 覆盖 + 校验 + 写回
 internal/httpx        TLS 指纹会话封装（bogdanfinn/tls-client, Chrome_120）
+internal/proxypool    代理池：Xray 核心管理 / 订阅拉取 / 分享链接解析 / 粘性选路与健康探测
 internal/openai       OpenAI 协议类型、prompt 拼接、tool_calls 解析
 internal/anthropic    Anthropic Messages 协议类型 + 与 OpenAI 消息的互转
 internal/turnstile    Turnstile 三种求解方式（API / 浏览器 CDP / 手动）+ 按线路/站点的 Cookie 缓存

@@ -15,6 +15,7 @@ import (
 	"github.com/nyoungo/dsfree2api/internal/config"
 	"github.com/nyoungo/dsfree2api/internal/logbuf"
 	"github.com/nyoungo/dsfree2api/internal/metrics"
+	"github.com/nyoungo/dsfree2api/internal/proxypool"
 	"github.com/nyoungo/dsfree2api/internal/turnstile"
 	"github.com/nyoungo/dsfree2api/internal/upstream"
 )
@@ -31,6 +32,7 @@ type Server struct {
 	met   *metrics.Recorder
 	logs  *logbuf.Buffer
 	ts    *turnstile.Solver
+	pool  *proxypool.Manager
 	log   *slog.Logger
 	start time.Time
 
@@ -39,7 +41,7 @@ type Server struct {
 	password string
 }
 
-func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *logbuf.Buffer, ts *turnstile.Solver, log *slog.Logger) *Server {
+func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *logbuf.Buffer, ts *turnstile.Solver, log *slog.Logger, pool *proxypool.Manager) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -50,7 +52,7 @@ func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *l
 		generated = true
 	}
 	s := &Server{
-		cfg: cfg, up: up, met: met, logs: logs, ts: ts, log: log,
+		cfg: cfg, up: up, met: met, logs: logs, ts: ts, pool: pool, log: log,
 		start: time.Now(), tokens: map[string]time.Time{}, password: pw,
 	}
 	if generated {
@@ -185,7 +187,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 		sites = append(sites, map[string]any{
 			"code": code, "base_url": st.BaseURL, "ajax_url": st.AJAXURL,
 			"language": st.Language, "sitekey": st.SiteKey, "enabled": st.Enabled,
-			"verify_action": st.VerifyAction,
+			"verify_action": st.VerifyAction, "proxies": st.Proxies,
 		})
 	}
 	proxyCfg := struct {
@@ -201,12 +203,17 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	keys := append([]string(nil), s.cfg.Security.APIKeys...)
 	s.cfg.RUnlock()
 
+	var poolStatus any
+	if s.pool != nil {
+		poolStatus = s.pool.Status()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"metrics":   s.met.Snapshot(),
 		"models":    models,
 		"sites":     sites,
 		"proxy":     proxyCfg,
 		"turnstile": map[string]any{"config": turnstileCfg, "status": s.ts.Status(siteCodes), "history": s.ts.History()},
+		"proxypool": poolStatus,
 		"keys":      keys,
 		"cache":     map[string]any{"chat_config_entries": s.up.ConfigCacheSize(), "routes": routeList(s.up)},
 		"system": map[string]any{
@@ -269,6 +276,9 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 // applyRuntime pushes a freshly edited config into the live subsystems.
 func (s *Server) applyRuntime() {
 	s.ts.SetConfig(s.currentTurnstile())
+	if s.pool != nil {
+		s.pool.Reload()
+	}
 }
 
 func (s *Server) currentTurnstile() config.Turnstile {

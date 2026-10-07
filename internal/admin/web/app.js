@@ -328,6 +328,7 @@ const mask = k => k.length > 16 ? k.slice(0, 7) + "…" + k.slice(-6) : k;
 PAGES.proxy = async () => {
   const ov = await fetchOverview();
   const p = ov.proxy;
+  const pool = ov.proxypool || { xray: {}, entries: [], subscriptions: [], sticky: {} };
   view.innerHTML = `
     <div class="grid g2">
       <div class="card"><h3>主线路</h3>
@@ -355,6 +356,49 @@ PAGES.proxy = async () => {
       <div class="row"><input id="px-fb" placeholder="socks5://..." style="width:280px"><button class="btn" id="px-add">添加</button></div></div>
       <div class="table-wrap mt"><table><thead><tr><th>#</th><th>地址</th><th></th></tr></thead><tbody id="tb-fb"></tbody></table></div>
       <div class="dim mt">当前生效顺序：${ov.cache.routes.map(r => `<span class="tag">${esc(r.name)} → ${esc(r.proxy)}</span>`).join(" ")}</div>
+    </div>
+    <div class="grid g2 mt">
+      <div class="card"><h3>代理池 · Xray 核心</h3>
+        <div class="row">
+          <div class="field"><label>池开关</label>${switchHTML("pool-en", pool.enabled)}</div>
+          <div class="field"><label>检查间隔（秒）</label><input id="pool-check-int" type="number" min="10" value="${pool.check_interval_seconds || 120}"></div>
+          <div class="field"><label>检查超时（秒）</label><input id="pool-check-to" type="number" min="2" value="${pool.check_timeout_seconds || 10}"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>健康检查 URL</label><input id="pool-check-url" value="${esc(pool.check_url || "")}" placeholder="https://www.gstatic.com/generate_204"></div>
+          <div class="field"><label>裸 ip:port 默认协议</label><input id="pool-scheme" value="${esc(pool.default_scheme || "http")}" placeholder="http / socks5"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Xray 路径（留空 = 自动）</label><input id="pool-xray-path" value="${esc(pool.xray_path || "")}" placeholder="留空自动下载到数据目录"></div>
+          <div class="field"><label>版本（留空 = latest）</label><input id="pool-xray-ver" value="${esc(pool.xray_version || "")}"></div>
+          <div class="field"><label>自动下载</label>${switchHTML("pool-xray-auto", pool.xray_auto_download)}</div>
+        </div>
+        <div class="row mt">
+          <button class="btn primary" id="pool-save">保存池配置</button>
+          <button class="btn" id="pool-refresh">刷新节点与健康检查</button>
+        </div>
+        <div class="dim mt">Xray：<span class="pill ${pool.xray.running ? "on" : "off"}">${pool.xray.running ? "运行中 · pid " + pool.xray.pid : "未运行"}</span>
+          ${pool.xray.error ? `<span style="color:var(--err)"> ${esc(pool.xray.error)}</span>` : ""}
+          ${pool.last_error ? `<br><span style="color:var(--err)">${esc(pool.last_error)}</span>` : ""}</div>
+      </div>
+      <div class="card"><h3>节点与端点</h3>
+        <div class="row"><input id="pool-name" placeholder="名称（字母数字-_）" style="width:180px">
+          <input id="pool-link" placeholder="vless://… 或 ip:port 或 socks5://user:pass@host:port" style="flex:1;min-width:200px">
+          <button class="btn" id="pool-add">添加</button></div>
+        <div class="table-wrap mt"><table><thead><tr><th>名称</th><th>类型</th><th>目标</th><th>健康</th><th class="num">延迟</th><th></th></tr></thead><tbody id="tb-pool"></tbody></table></div>
+        <div class="dim mt">分享链接（vless / vmess / trojan / ss）由内置 Xray 核心承载；ip:port / socks5:// 等端点直接使用。</div>
+      </div>
+    </div>
+    <div class="card mt"><div class="toolbar"><h3 style="margin:0">订阅</h3>
+      <div class="row"><input id="sub-name" placeholder="名称" style="width:150px">
+        <input id="sub-url" placeholder="https://…/sub?token=…" style="width:360px">
+        <input id="sub-int" type="number" min="5" value="60" title="刷新间隔（分钟）" style="width:90px">
+        <button class="btn" id="sub-add">添加订阅</button></div></div>
+      <div class="table-wrap mt"><table><thead><tr><th>名称</th><th>地址</th><th class="num">间隔</th><th class="num">节点</th><th>上次拉取</th><th></th></tr></thead><tbody id="tb-subs"></tbody></table></div>
+    </div>
+    <div class="card mt"><h3>站点绑定（按顺序，粘性选路）</h3>
+      <div class="table-wrap"><table><thead><tr><th>站点</th><th>绑定（逗号分隔：名称 或 sub:订阅名）</th><th>当前出口</th><th></th></tr></thead><tbody id="tb-bind"></tbody></table></div>
+      <div class="dim mt">未绑定、或绑定节点全部不健康时，回退到主线路 / 备用线路。Cookie 与出口 IP 绑定：切换出口后该站点会在下一轮巡检重新求解 Turnstile。</div>
     </div>`;
 
   const renderFb = list => {
@@ -368,6 +412,98 @@ PAGES.proxy = async () => {
     });
   };
   renderFb(p.fallbacks || []);
+
+  const renderPool = () => {
+    const entries = pool.entries || [];
+    $("#tb-pool").innerHTML = entries.length ? entries.map(e => {
+      const health = e.parse_error ? `<span class="pill off" title="${esc(e.parse_error)}">解析失败</span>`
+        : e.checked ? (e.healthy ? '<span class="pill on">健康</span>' : `<span class="pill off" title="${esc(e.last_error || "")}">不可用</span>`)
+        : '<span class="pill">未探测</span>';
+      return `<tr><td><code>${esc(e.name)}</code>${e.source ? ` <span class="dim">← ${esc(e.source)}</span>` : ""}</td>
+        <td>${esc(e.kind === "url" ? e.scheme : (e.scheme || "xray"))}</td>
+        <td class="dim">${esc(e.target || "")}</td>
+        <td>${health}</td><td class="num">${e.latency_ms ? e.latency_ms + "ms" : "–"}</td>
+        <td class="right"><button class="btn small" data-ptoggle="${esc(e.name)}" data-pen="${e.enabled ? "0" : "1"}">${e.enabled ? "停用" : "启用"}</button>
+        ${e.source ? "" : `<button class="btn small danger" data-pdel="${esc(e.name)}">删除</button>`}</td></tr>`;
+    }).join("") : '<tr><td colspan="6" class="empty">尚无节点 —— 添加分享链接或 ip:port 端点</td></tr>';
+    $$("[data-ptoggle]").forEach(b => b.onclick = async () => {
+      try { await api("/api/actions", { body: { action: "pool_toggle_entry", name: b.dataset.ptoggle, enabled: b.dataset.pen === "1" } }); PAGES.proxy(); }
+      catch (e) { toast(e.message, "err"); }
+    });
+    $$("[data-pdel]").forEach(b => b.onclick = async () => {
+      if (!confirm("删除节点 " + b.dataset.pdel + "？")) return;
+      try { await api("/api/actions", { body: { action: "pool_delete_entry", name: b.dataset.pdel } }); PAGES.proxy(); }
+      catch (e) { toast(e.message, "err"); }
+    });
+
+    const subs = pool.subscriptions || [];
+    $("#tb-subs").innerHTML = subs.length ? subs.map(s => `
+      <tr><td><code>${esc(s.name)}</code></td><td class="dim">${esc(s.url)}</td>
+      <td class="num">${s.interval_minutes || 60}m</td><td class="num">${s.nodes || 0}</td>
+      <td class="dim">${s.fetched_at ? timeStr(s.fetched_at * 1000) : "未拉取"}${s.last_error ? ` <span style="color:var(--err)">${esc(String(s.last_error).slice(0, 60))}</span>` : ""}</td>
+      <td class="right"><button class="btn small" data-stoggle="${esc(s.name)}" data-sen="${s.enabled ? "0" : "1"}">${s.enabled ? "停用" : "启用"}</button>
+      <button class="btn small danger" data-sdel="${esc(s.name)}">删除</button></td></tr>`).join("")
+      : '<tr><td colspan="6" class="empty">尚无订阅</td></tr>';
+    $$("[data-stoggle]").forEach(b => b.onclick = async () => {
+      try { await api("/api/actions", { body: { action: "pool_toggle_sub", name: b.dataset.stoggle, enabled: b.dataset.sen === "1" } }); PAGES.proxy(); }
+      catch (e) { toast(e.message, "err"); }
+    });
+    $$("[data-sdel]").forEach(b => b.onclick = async () => {
+      if (!confirm("删除订阅 " + b.dataset.sdel + "？")) return;
+      try { await api("/api/actions", { body: { action: "pool_delete_sub", name: b.dataset.sdel } }); PAGES.proxy(); }
+      catch (e) { toast(e.message, "err"); }
+    });
+
+    const sticky = pool.sticky || {};
+    $("#tb-bind").innerHTML = (ov.sites || []).map(s => {
+      const cur = sticky[s.code];
+      const curEntry = entries.find(e => e.name === cur);
+      return `<tr><td><b>${esc(s.code.toUpperCase())}</b></td>
+        <td><input data-bind="${esc(s.code)}" value="${esc((s.proxies || []).join(", "))}" placeholder="留空 = 全局线路"></td>
+        <td class="dim">${cur ? `${esc(cur)} → ${esc(curEntry ? curEntry.target : "?")}` : "全局线路"}</td>
+        <td class="right"><button class="btn small" data-bsave="${esc(s.code)}">保存</button></td></tr>`;
+    }).join("");
+    $$("[data-bsave]").forEach(b => b.onclick = async () => {
+      const input = $(`[data-bind="${CSS.escape(b.dataset.bsave)}"]`);
+      const list = input.value.split(",").map(x => x.trim()).filter(Boolean);
+      try { await api("/api/actions", { body: { action: "pool_set_site", site: b.dataset.bsave, proxies: list } }); toast("已保存", "ok"); PAGES.proxy(); }
+      catch (e) { toast(e.message, "err"); }
+    });
+  };
+  renderPool();
+
+  $("#pool-save").onclick = async () => {
+    try {
+      await api("/api/actions", { body: {
+        action: "pool_set_config",
+        enabled: $("#pool-en").checked,
+        check_interval_seconds: +$("#pool-check-int").value || 120,
+        check_timeout_seconds: +$("#pool-check-to").value || 10,
+        check_url: $("#pool-check-url").value.trim(),
+        default_scheme: $("#pool-scheme").value.trim() || "http",
+        xray_path: $("#pool-xray-path").value.trim(),
+        xray_version: $("#pool-xray-ver").value.trim(),
+        xray_auto_download: $("#pool-xray-auto").checked } });
+      toast("池配置已保存", "ok"); PAGES.proxy();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#pool-refresh").onclick = async () => {
+    const b = $("#pool-refresh"); b.disabled = true; b.textContent = "刷新中…";
+    try { await api("/api/actions", { body: { action: "pool_refresh" } }); toast("已在后台拉取订阅并检查健康，稍后重进本页查看", "ok"); PAGES.proxy(); }
+    catch (e) { toast(e.message, "err"); b.disabled = false; b.textContent = "刷新节点与健康检查"; }
+  };
+  $("#pool-add").onclick = async () => {
+    try {
+      await api("/api/actions", { body: { action: "pool_add_entry", name: $("#pool-name").value.trim(), link: $("#pool-link").value.trim() } });
+      toast("已添加", "ok"); PAGES.proxy();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("#sub-add").onclick = async () => {
+    try {
+      await api("/api/actions", { body: { action: "pool_add_sub", name: $("#sub-name").value.trim(), url: $("#sub-url").value.trim(), interval_minutes: +$("#sub-int").value || 60 } });
+      toast("已添加", "ok"); PAGES.proxy();
+    } catch (e) { toast(e.message, "err"); }
+  };
 
   $("#px-save").onclick = async () => {
     try {
@@ -406,6 +542,7 @@ async function merged(mutate) {
 }
 
 PAGES.turnstile = async () => {
+  if (overviewTimer) { clearInterval(overviewTimer); overviewTimer = null; }
   const ov = await fetchOverview();
   const t = ov.turnstile.config;
   view.innerHTML = `

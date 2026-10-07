@@ -18,6 +18,7 @@ import (
 	"github.com/nyoungo/dsfree2api/internal/config"
 	"github.com/nyoungo/dsfree2api/internal/logbuf"
 	"github.com/nyoungo/dsfree2api/internal/metrics"
+	"github.com/nyoungo/dsfree2api/internal/proxypool"
 	"github.com/nyoungo/dsfree2api/internal/turnstile"
 	"github.com/nyoungo/dsfree2api/internal/upstream"
 )
@@ -75,9 +76,18 @@ func main() {
 	defer met.Close()
 
 	ts := turnstile.New(cfg.Turnstile, cfg.Upstream.UserAgent)
-	up := upstream.New(cfg, ts, logger)
+
+	// Proxy pool: per-site egress endpoints (Xray share links, subscriptions,
+	// plain http/socks5) with sticky selection. No-op unless enabled.
+	pool := proxypool.New(cfg, dataDir, logger)
+	poolCtx, poolCancel := context.WithCancel(context.Background())
+	defer poolCancel()
+	pool.Start(poolCtx)
+
+	up := upstream.New(cfg, ts, logger, pool)
+
 	apiSrv := api.New(cfg, up, met, logs, ts, logger)
-	adminSrv := admin.New(cfg, up, met, logs, ts, logger)
+	adminSrv := admin.New(cfg, up, met, logs, ts, logger, pool)
 
 	mainAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	mainHTTP := &http.Server{

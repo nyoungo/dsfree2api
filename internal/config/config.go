@@ -59,6 +59,41 @@ type Site struct {
 	VerifyAction string `toml:"verify_action" json:"verify_action"`
 	Language     string `toml:"language" json:"language"`
 	Enabled      bool   `toml:"enabled" json:"enabled"`
+	// Proxies binds this site to the proxy pool: an ordered list of entry
+	// names and/or "sub:<name>" references. Empty = global [proxy] routes.
+	Proxies []string `toml:"proxies" json:"proxies"`
+	// WarmPoolOnly keeps the cookie warmer on the pool routes bound via
+	// Proxies; the global [proxy] primary/fallback lanes are not pre-solved
+	// (they remain available for request-time failover). Default false.
+	WarmPoolOnly bool `toml:"warm_pool_only" json:"warm_pool_only"`
+}
+
+// ProxyEntry is one manually configured pool node: an Xray share link
+// (vless/vmess/trojan/ss) or a plain http/https/socks5 endpoint.
+type ProxyEntry struct {
+	Link    string `toml:"link" json:"link"`
+	Enabled bool   `toml:"enabled" json:"enabled"`
+}
+
+// ProxySubscription is a remote node list refreshed on an interval.
+type ProxySubscription struct {
+	URL             string `toml:"url" json:"url"`
+	Enabled         bool   `toml:"enabled" json:"enabled"`
+	IntervalMinutes int    `toml:"interval_minutes" json:"interval_minutes"`
+}
+
+// ProxyPool configures the egress pool and its managed Xray core.
+type ProxyPool struct {
+	Enabled              bool                          `toml:"enabled" json:"enabled"`
+	CheckIntervalSeconds int                           `toml:"check_interval_seconds" json:"check_interval_seconds"`
+	CheckTimeoutSeconds  int                           `toml:"check_timeout_seconds" json:"check_timeout_seconds"`
+	CheckURL             string                        `toml:"check_url" json:"check_url"`
+	DefaultScheme        string                        `toml:"default_scheme" json:"default_scheme"`
+	XrayPath             string                        `toml:"xray_path" json:"xray_path"`
+	XrayVersion          string                        `toml:"xray_version" json:"xray_version"`
+	XrayAutoDownload     bool                          `toml:"xray_auto_download" json:"xray_auto_download"`
+	Entries              map[string]*ProxyEntry        `toml:"entries" json:"entries"`
+	Subscriptions        map[string]*ProxySubscription `toml:"subscriptions" json:"subscriptions"`
 }
 
 type Model struct {
@@ -101,6 +136,7 @@ type Config struct {
 		SlowStartSeconds float64  `toml:"slow_start_seconds" json:"slow_start_seconds"`
 	} `toml:"proxy" json:"proxy"`
 
+	ProxyPool ProxyPool `toml:"proxypool" json:"proxypool"`
 	Upstream struct {
 		Timeout             float64 `toml:"timeout" json:"timeout"`
 		StreamTimeout       float64 `toml:"stream_timeout" json:"stream_timeout"`
@@ -123,6 +159,20 @@ type Config struct {
 
 	mu   sync.RWMutex `toml:"-"`
 	path string       `toml:"-"`
+}
+
+// DefaultProxyPool returns the built-in pool settings (feature off, Xray
+// auto-download on).
+func DefaultProxyPool() ProxyPool {
+	return ProxyPool{
+		CheckIntervalSeconds: 120,
+		CheckTimeoutSeconds:  10,
+		CheckURL:             "https://www.gstatic.com/generate_204",
+		DefaultScheme:        "http",
+		XrayAutoDownload:     true,
+		Entries:              map[string]*ProxyEntry{},
+		Subscriptions:        map[string]*ProxySubscription{},
+	}
 }
 
 func DefaultTurnstile() Turnstile {
@@ -201,6 +251,7 @@ func newConfig() *Config {
 	c.Upstream.CrossSiteFailover = true
 	c.Upstream.ContinueRounds = 20
 	c.Runtime.DataDir = "./data"
+	c.ProxyPool = DefaultProxyPool()
 	c.Turnstile = DefaultTurnstile()
 	c.Sites = DefaultSites(c.Turnstile.SiteKey)
 	c.Models = DefaultModels()
@@ -300,21 +351,35 @@ func (c *Config) applyDefaults(md *toml.MetaData) {
 		c.Turnstile.Enabled = true
 		c.Upstream.AutoRefresh = true
 		c.Upstream.ContinueRounds = 20
+		c.ProxyPool.XrayAutoDownload = true
 		for _, s := range c.Sites {
 			s.Enabled = true
 		}
 		for _, m := range c.Models {
 			m.Enabled = true
 		}
+		for _, e := range c.ProxyPool.Entries {
+			e.Enabled = true
+		}
+		for _, sc := range c.ProxyPool.Subscriptions {
+			sc.Enabled = true
+		}
 		return
 	}
 	def(md.IsDefined("turnstile", "enabled"), &c.Turnstile.Enabled, true)
 	def(md.IsDefined("upstream", "auto_refresh"), &c.Upstream.AutoRefresh, true)
+	def(md.IsDefined("proxypool", "xray_auto_download"), &c.ProxyPool.XrayAutoDownload, true)
 	for code, s := range c.Sites {
 		def(md.IsDefined("sites", code, "enabled"), &s.Enabled, true)
 	}
 	for id, m := range c.Models {
 		def(md.IsDefined("models", id, "enabled"), &m.Enabled, true)
+	}
+	for name, e := range c.ProxyPool.Entries {
+		def(md.IsDefined("proxypool", "entries", name, "enabled"), &e.Enabled, true)
+	}
+	for name, sc := range c.ProxyPool.Subscriptions {
+		def(md.IsDefined("proxypool", "subscriptions", name, "enabled"), &sc.Enabled, true)
 	}
 }
 

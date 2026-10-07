@@ -33,6 +33,37 @@ fallback_urls = []
 # 主线路允许的首事件等待秒数（>0 且存在备用线路时生效）。
 slow_start_seconds = 8
 
+[proxypool]
+# 代理池：为每个站点绑定独立出口（Xray 分享链接 / 订阅 / ip:port 端点）。
+# 选路为粘性：优先使用绑定列表中第一个健康节点，失败才切换；未绑定或
+# 全部不健康时回退到上面的 [proxy] 主/备线路。Turnstile 求解与请求共用
+# 同一出口（Cookie 与出口 IP 绑定，换出口后会自动重新求解）。
+enabled = false
+check_interval_seconds = 120   # 健康检查间隔
+check_timeout_seconds = 10     # 单次探测超时
+check_url = "https://www.gstatic.com/generate_204"
+default_scheme = "http"        # 裸 ip:port 的默认协议（http / socks5）
+# Xray 核心：留空 xray_path 且开启自动下载时，首次使用会下载到数据目录
+# （data/xray.exe；核心配置写到 data/config.json）。分享链接（vless / vmess
+# / trojan / ss）由它承载；纯 ip:port / socks5:// 端点无需核心。
+xray_path = ""
+xray_version = ""              # 留空 = 最新版
+xray_auto_download = true
+
+# 手动节点（名称限字母 / 数字 / - / _）：
+# [proxypool.entries.node-a]
+# link = "vless://uuid@host:443?type=ws&security=tls&sni=example.com&path=/ws#node-a"
+# link = "socks5://user:pass@1.2.3.4:1080"
+# link = "1.2.3.4:8080"                  # 使用 default_scheme
+# link = "1.2.3.4:8080:user:pass"
+# enabled = true                          # 缺省即启用
+
+# 订阅（按 interval_minutes 自动刷新；节点名形如 <订阅名>#xxxxxxxx）：
+# [proxypool.subscriptions.home]
+# url = "https://example.com/api/v1/client/subscribe?token=…"
+# interval_minutes = 60
+# enabled = true
+
 [upstream]
 timeout = 60.0
 stream_timeout = 300.0
@@ -80,6 +111,9 @@ base_url = "https://deepseek.de"
 ajax_url = "https://deepseek.de/wp-admin/admin-ajax.php"
 sitekey = "0x4AAAAAADlLZ3ljqZP6cQwq"
 language = "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+# 站点级出口绑定（代理池条目名或 "sub:订阅名"，按顺序粘性选路）；
+# 留空 = 使用 [proxy] 主/备线路。三个站点可各自独立配置。
+# proxies = ["node-a", "sub:home"]
 
 [sites.es]
 base_url = "https://deepseek.es"
