@@ -411,7 +411,11 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 	for attempt := 0; ; attempt++ {
 		var failed []Route
 		for i, route := range routes {
-			allowSlow := i == 0 && len(routes) > 1
+			// A first-time Turnstile solve can far exceed the slow-start
+			// budget; only arm the timer when cookies are already cached
+			// (or no solver is configured at all).
+			cookiesReady := c.ts == nil || c.ts.CookiesReady(site.Code, route.Proxy)
+			allowSlow := i == 0 && len(routes) > 1 && cookiesReady
 			err := c.chatOnceSlowStart(ctx, site, modelID, model, prompt, route, allowSlow, info, yield)
 			if err == nil {
 				if sawQuota {

@@ -563,6 +563,10 @@ PAGES.turnstile = async () => {
           <div class="row">
             <div class="field"><label>Sitekey</label><input id="ts-sitekey" value="${esc(t.sitekey)}"></div>
             <div class="field"><label>Action</label><input id="ts-action" value="${esc(t.action)}"></div>
+            <div class="field"><label>API 风格</label><select id="ts-style">
+              <option value="sync">sync（CapSolver 形状）</option>
+              <option value="ezsolver">ezsolver（本地 EzSolver）</option>
+            </select></div>
           </div>
         </div>
         <div id="ts-browser" class="ts-panel" style="display:none">
@@ -596,6 +600,20 @@ PAGES.turnstile = async () => {
           <div class="dim">Cookie 与出口 IP / UA 绑定：请在同一代理线路的浏览器中获取。导入后在 TTL 内免求解，状态见右侧「已验证 Cookie」。</div>
           <button class="btn primary mt" id="im-save">导入</button>
         </div>
+        <div class="ts-panel">
+          <div class="ts-panel-title">求解与 Cookie 池</div>
+          <div class="row">
+            <div class="field"><label>求解超时（秒）</label><input id="ts-timeout" type="number" min="5" max="600" value="${t.timeout_seconds || 90}"></div>
+            <div class="field"><label>失败重试（次）</label><input id="ts-retries" type="number" min="1" max="20" value="${t.retries || 5}"></div>
+            <div class="field"><label>重试退避（秒）</label><input id="ts-backoff" type="number" min="0" max="60" step="0.5" value="${t.retry_backoff_seconds == null ? 1.5 : t.retry_backoff_seconds}"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>Cookie 池（后台预热）</label>${switchHTML("ts-warm", !!t.warm_enabled)}</div>
+            <div class="field"><label>预热阈值（剩余 %）</label><input id="ts-ratio" type="number" min="5" max="95" value="${Math.round((t.warm_ratio == null ? 0.3 : t.warm_ratio) * 100)}"></div>
+            <div class="field"><label>检查间隔（秒）</label><input id="ts-check" type="number" min="5" max="3600" value="${t.warm_check_seconds || 60}"></div>
+          </div>
+          <div class="dim">Cookie 池开启后：后台每隔检查间隔巡检一次，剩余 TTL 低于阈值时主动重解，请求路径不再等待求解耗时（manual 方式不预热）。</div>
+        </div>
         <div class="dim" id="ts-hint" style="margin-top:10px"></div>
         <button class="btn primary mt" id="ts-save">保存配置</button>
       </div>
@@ -605,7 +623,11 @@ PAGES.turnstile = async () => {
           <button class="btn" id="ts-refresh">强制刷新全部</button>
           <button class="btn danger" id="ts-clear">清空 Cookie</button>
         </div>
-        <div class="dim mt">缓存 TTL ${t.cookie_ttl_seconds}s · 求解失败重试 ${t.retries} 次 · 退避 ${t.retry_backoff_seconds}s</div>
+        <div class="dim mt">缓存 TTL ${t.cookie_ttl_seconds}s · 求解超时 ${t.timeout_seconds || 90}s · 重试 ${t.retries} 次 · 退避 ${t.retry_backoff_seconds}s</div>
+      </div>
+      <div class="card"><h3>Cookie 池</h3>
+        <div class="dim" id="ts-pool-state"></div>
+        <div id="ts-pool" class="grid mt" style="gap:8px"></div>
       </div>
     </div>
     <div class="card mt"><h3>求解历史</h3><div class="table-wrap"><table>
@@ -626,13 +648,39 @@ PAGES.turnstile = async () => {
     <td><span class="pill ${h.ok ? "on" : "off"}">${h.ok ? "成功" : "失败"}</span>${h.error ? ` <span class="dim">${esc(h.error.slice(0, 70))}</span>` : ""}</td></tr>`).join("")
     : '<tr><td colspan="5" class="empty">尚无记录</td></tr>';
 
+  const renderPool = (o) => {
+    const pool = (o.turnstile && o.turnstile.pool) || { entries: [] };
+    const label = $("#ts-pool-state");
+    if (label) {
+      label.textContent = `状态：${pool.enabled ? (pool.running ? "运行中" : "已启用，等待下一轮巡检") : "未开启"} · 阈值 剩余 ${Math.round((pool.ratio || 0.3) * 100)}% · 每 ${pool.check_seconds || 60}s 巡检一次`;
+    }
+    const box = $("#ts-pool");
+    if (!box) return;
+    const entries = pool.entries || [];
+    box.innerHTML = entries.length ? entries.map(e => {
+      const state = e.warming ? '<span class="pill warn">预热中</span>'
+        : e.valid ? '<span class="pill on">就绪</span>'
+        : e.last_error ? '<span class="pill off">求解失败</span>' : '<span class="pill off">未建立</span>';
+      const left = e.valid ? `剩余 ${Math.max(0, Math.round(e.remaining_s / 60))} 分钟` : "等待预热";
+      const next = e.next_warm_at ? `下次 ${timeStr(e.next_warm_at * 1000)}` : "—";
+      const last = e.last_at ? `上次 ${timeStr(e.last_at * 1000)} · ${fmtMs(e.last_ms)}` : "尚未求解";
+      return `<div class="card" style="padding:10px">
+        <div class="toolbar"><div><b>${esc(e.site.toUpperCase())}</b> <span class="dim">${esc(e.route)}</span></div>${state}</div>
+        <div class="dim mt">${left} · ${next}<br>${last}${e.last_error ? `<br><span style="color:var(--err)">${esc(String(e.last_error).slice(0, 90))}</span>` : ""}</div>
+      </div>`;
+    }).join("") : '<div class="dim">暂无池内记录 — 开启预热并等待下一轮巡检</div>';
+  };
+  renderPool(ov);
+  overviewTimer = setInterval(() => { fetchOverview().then(renderPool).catch(() => {}); }, 5000);
+
   $$("[data-rf]").forEach(b => b.onclick = async () => {
     b.disabled = true;
-    try { await api("/api/actions", { body: { action: "refresh_cookies", site: b.dataset.rf } }); toast("已作废，将在下次请求时重新求解", "ok"); PAGES.turnstile(); }
+    try { await api("/api/actions", { body: { action: "refresh_cookies", site: b.dataset.rf } }); toast(t.warm_enabled ? "已作废，Cookie 池将在下一轮巡检时重新预热" : "已作废，将在下次请求时重新求解", "ok"); PAGES.turnstile(); }
     catch (e) { toast(e.message, "err"); }
     b.disabled = false;
   });
   $("#ts-provider").value = t.provider || "api";
+  $("#ts-style").value = t.api_style === "ezsolver" ? "ezsolver" : "sync";
   const TS_HINTS = {
     api: ["已开启：调用求解服务 API 获取 Turnstile Token", "已关闭：跳过 Turnstile 求解，直接请求上游站点"],
     browser: ["已开启：用下方配置的本地浏览器自动求解 Token", "已关闭：跳过 Turnstile 求解，直接请求上游站点"],
@@ -658,6 +706,13 @@ PAGES.turnstile = async () => {
         api_url: $("#ts-url").value.trim(),
         api_key: $("#ts-key").value.trim(), sitekey: $("#ts-sitekey").value.trim(),
         challenge_action: $("#ts-action").value.trim(), cookie_ttl_seconds: +$("#ts-ttl").value,
+        api_style: $("#ts-style").value,
+        timeout_seconds: Math.round(+$("#ts-timeout").value || 90),
+        retries: Math.round(+$("#ts-retries").value || 5),
+        retry_backoff_seconds: Math.max(0, +$("#ts-backoff").value || 0),
+        warm_enabled: $("#ts-warm").checked,
+        warm_ratio: Math.min(95, Math.max(5, Math.round(+$("#ts-ratio").value || 30))) / 100,
+        warm_check_seconds: Math.round(+$("#ts-check").value || 60),
         browser_path: $("#ts-bpath").value.trim(),
         browser_headless: $("#ts-bhead").checked,
         browser_user_data_dir: $("#ts-bprof").value.trim(),

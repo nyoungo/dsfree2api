@@ -235,12 +235,20 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 			Challenge string  `json:"challenge_action"`
 			Legacy    string  `json:"ts_action"`
 			CookieTT  int     `json:"cookie_ttl_seconds"`
+			APIStyle  *string `json:"api_style"`
 
 			BrowserPath        *string `json:"browser_path"`
 			BrowserHeadless    *bool   `json:"browser_headless"`
 			BrowserUserDataDir *string `json:"browser_user_data_dir"`
 			BrowserTimezone    *string `json:"browser_timezone"`
 			BrowserLocale      *string `json:"browser_locale"`
+
+			TimeoutSeconds      *int     `json:"timeout_seconds"`
+			Retries             *int     `json:"retries"`
+			RetryBackoffSeconds *float64 `json:"retry_backoff_seconds"`
+			WarmEnabled         *bool    `json:"warm_enabled"`
+			WarmRatio           *float64 `json:"warm_ratio"`
+			WarmCheckSeconds    *int     `json:"warm_check_seconds"`
 		}
 		_ = json.Unmarshal(body, &p)
 		// Build the candidate config first: a rejected save must not leave
@@ -277,8 +285,29 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		if act := firstNonEmpty(p.Challenge, p.Legacy); act != "" {
 			tc.Action = act
 		}
+		if p.APIStyle != nil {
+			tc.APIStyle = strings.ToLower(strings.TrimSpace(*p.APIStyle))
+		}
 		if p.CookieTT > 0 {
 			tc.CookieTTLSeconds = p.CookieTT
+		}
+		if p.TimeoutSeconds != nil {
+			tc.TimeoutSeconds = clampInt(*p.TimeoutSeconds, 5, 600)
+		}
+		if p.Retries != nil {
+			tc.Retries = clampInt(*p.Retries, 1, 20)
+		}
+		if p.RetryBackoffSeconds != nil {
+			tc.RetryBackoffSeconds = clampFloat(*p.RetryBackoffSeconds, 0, 60)
+		}
+		if p.WarmEnabled != nil {
+			tc.WarmEnabled = *p.WarmEnabled
+		}
+		if p.WarmRatio != nil {
+			tc.WarmRatio = clampFloat(*p.WarmRatio, 0.05, 0.95)
+		}
+		if p.WarmCheckSeconds != nil {
+			tc.WarmCheckSeconds = clampInt(*p.WarmCheckSeconds, 5, 3600)
 		}
 		tc.Enabled = p.Enabled
 		if tc.Enabled {

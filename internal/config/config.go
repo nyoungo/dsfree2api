@@ -14,6 +14,15 @@ import (
 
 const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 
+// Turnstile tuning defaults. DefaultSolveTimeoutSeconds is the single source
+// for how long one solve attempt may run; the warm_* values drive the cookie
+// pool (background pre-solving).
+const (
+	DefaultSolveTimeoutSeconds = 90
+	DefaultWarmRatio           = 0.3
+	DefaultWarmCheckSeconds    = 60
+)
+
 // Turnstile token providers: api calls a hosted solver, browser drives a
 // local Chrome/Edge over CDP, manual only ever uses imported cookies.
 const (
@@ -29,10 +38,17 @@ type Turnstile struct {
 	APIKey              string  `toml:"api_key" json:"api_key"`
 	SiteKey             string  `toml:"sitekey" json:"sitekey"`
 	Action              string  `toml:"action" json:"action"`
+	APIStyle            string  `toml:"api_style" json:"api_style"`
 	TimeoutSeconds      int     `toml:"timeout_seconds" json:"timeout_seconds"`
 	CookieTTLSeconds    int     `toml:"cookie_ttl_seconds" json:"cookie_ttl_seconds"`
 	Retries             int     `toml:"retries" json:"retries"`
 	RetryBackoffSeconds float64 `toml:"retry_backoff_seconds" json:"retry_backoff_seconds"`
+
+	// Cookie pool: a background loop re-solves a site × route slot before its
+	// cached cookie expires, so requests never pay the solve latency.
+	WarmEnabled      bool    `toml:"warm_enabled" json:"warm_enabled"`
+	WarmRatio        float64 `toml:"warm_ratio" json:"warm_ratio"`
+	WarmCheckSeconds int     `toml:"warm_check_seconds" json:"warm_check_seconds"`
 
 	// provider = "browser"
 	BrowserPath        string `toml:"browser_path" json:"browser_path"`
@@ -49,6 +65,65 @@ func (t Turnstile) ProviderValue() string {
 		return ProviderAPI
 	}
 	return p
+}
+
+// APIStyleValue normalizes api_style for provider "api": "sync" (CapSolver-
+// shaped single POST) or "ezsolver" (POST {sitekey,siteurl,timeout} → {token}).
+func (t Turnstile) APIStyleValue() string {
+	switch strings.ToLower(strings.TrimSpace(t.APIStyle)) {
+	case "ezsolver", "ez":
+		return "ezsolver"
+	default:
+		return "sync"
+	}
+}
+
+// SolveTimeoutValue normalizes timeout_seconds: the longest one solve attempt
+// may run (default 90s, clamped to 5–600s).
+func (t Turnstile) SolveTimeoutValue() int {
+	n := t.TimeoutSeconds
+	if n <= 0 {
+		return DefaultSolveTimeoutSeconds
+	}
+	if n < 5 {
+		return 5
+	}
+	if n > 600 {
+		return 600
+	}
+	return n
+}
+
+// WarmRatioValue normalizes warm_ratio: a pooled cookie is re-solved once its
+// remaining TTL drops below this fraction (default 30%, clamped 5–95%).
+func (t Turnstile) WarmRatioValue() float64 {
+	r := t.WarmRatio
+	if r <= 0 {
+		return DefaultWarmRatio
+	}
+	if r < 0.05 {
+		return 0.05
+	}
+	if r > 0.95 {
+		return 0.95
+	}
+	return r
+}
+
+// WarmCheckValue normalizes warm_check_seconds: how often the pool is
+// inspected (default 60s, clamped 5s–1h).
+func (t Turnstile) WarmCheckValue() int {
+	n := t.WarmCheckSeconds
+	if n <= 0 {
+		return DefaultWarmCheckSeconds
+	}
+	if n < 5 {
+		return 5
+	}
+	if n > 3600 {
+		return 3600
+	}
+	return n
 }
 
 type Site struct {
@@ -183,10 +258,12 @@ func DefaultTurnstile() Turnstile {
 		APIKey:              "",
 		SiteKey:             "0x4AAAAAADlLZ3ljqZP6cQwq",
 		Action:              "chat",
-		TimeoutSeconds:      90,
+		TimeoutSeconds:      DefaultSolveTimeoutSeconds,
 		CookieTTLSeconds:    10800,
 		Retries:             5,
 		RetryBackoffSeconds: 1.5,
+		WarmRatio:           DefaultWarmRatio,
+		WarmCheckSeconds:    DefaultWarmCheckSeconds,
 	}
 }
 
@@ -428,6 +505,34 @@ func (c *Config) applyEnv() error {
 	if v := str("TURNSTILE_BROWSER_PATH"); v != nil && strings.TrimSpace(*v) != "" {
 		c.Turnstile.BrowserPath = strings.TrimSpace(*v)
 	}
+	if v := str("TURNSTILE_TIMEOUT_SECONDS"); v != nil {
+		n, err := strconv.Atoi(strings.TrimSpace(*v))
+		if err != nil || n < 1 {
+			return fmt.Errorf("invalid TURNSTILE_TIMEOUT_SECONDS %q", *v)
+		}
+		c.Turnstile.TimeoutSeconds = n
+	}
+	if v := str("TURNSTILE_WARM_ENABLED"); v != nil {
+		b, err := strconv.ParseBool(strings.TrimSpace(*v))
+		if err != nil {
+			return fmt.Errorf("invalid TURNSTILE_WARM_ENABLED %q", *v)
+		}
+		c.Turnstile.WarmEnabled = b
+	}
+	if v := str("TURNSTILE_WARM_RATIO"); v != nil {
+		f, err := strconv.ParseFloat(strings.TrimSpace(*v), 64)
+		if err != nil || f <= 0 || f > 1 {
+			return fmt.Errorf("invalid TURNSTILE_WARM_RATIO %q (expected 0–1)", *v)
+		}
+		c.Turnstile.WarmRatio = f
+	}
+	if v := str("TURNSTILE_WARM_CHECK_SECONDS"); v != nil {
+		n, err := strconv.Atoi(strings.TrimSpace(*v))
+		if err != nil || n < 1 {
+			return fmt.Errorf("invalid TURNSTILE_WARM_CHECK_SECONDS %q", *v)
+		}
+		c.Turnstile.WarmCheckSeconds = n
+	}
 	if v := str("TURNSTILE_ENABLED"); v != nil {
 		b, err := strconv.ParseBool(strings.TrimSpace(*v))
 		if err != nil {
@@ -517,7 +622,8 @@ func (c *Config) validateTurnstile() error {
 		if c.Turnstile.APIURL == "" {
 			return errors.New("turnstile.api_url is empty (set config to your solver endpoint, or use provider = \"manual\")")
 		}
-		if c.Turnstile.APIKey == "" {
+		// Local solve services (api_style = "ezsolver") usually need no key.
+		if c.Turnstile.APIKey == "" && c.Turnstile.APIStyleValue() != "ezsolver" {
 			return errors.New("turnstile.api_key is empty (set config, or TURNSTILE_API_KEY)")
 		}
 	case ProviderBrowser:

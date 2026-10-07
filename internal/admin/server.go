@@ -212,7 +212,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 		"models":    models,
 		"sites":     sites,
 		"proxy":     proxyCfg,
-		"turnstile": map[string]any{"config": turnstileCfg, "status": s.ts.Status(siteCodes), "history": s.ts.History()},
+		"turnstile": map[string]any{"config": turnstileCfg, "status": s.ts.Status(siteCodes), "history": s.ts.History(), "pool": s.ts.PoolStatus()},
 		"proxypool": poolStatus,
 		"keys":      keys,
 		"cache":     map[string]any{"chat_config_entries": s.up.ConfigCacheSize(), "routes": routeList(s.up)},

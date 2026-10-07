@@ -2,7 +2,11 @@ package turnstile
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -237,5 +241,45 @@ func TestRotateGuestSwapsVisitorID(t *testing.T) {
 	}
 	if got := solver.RotateGuest("no-such-site"); got != "" {
 		t.Errorf("rotating an unknown site returned %q, want empty", got)
+	}
+}
+
+func TestSolveTokenAPIEzSolverStyle(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"token":"tok-123","elapsed":1.5}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.Turnstile{
+		Enabled: true, Provider: config.ProviderAPI, APIStyle: "ezsolver",
+		APIURL: srv.URL, TimeoutSeconds: 30, Retries: 1,
+	}
+	solver := New(cfg, httpx.DefaultUserAgent)
+	// A broken route-proxied client proves the loopback bypass: the call must
+	// still succeed because local solve services are reached directly.
+	brokenURL, _ := url.Parse("socks5://127.0.0.1:1")
+	c := &core{
+		proxy:  "direct",
+		client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(brokenURL)}},
+		cache:  map[string]*cookieState{}, locks: map[string]*sync.Mutex{},
+	}
+
+	token, err := solver.solveTokenAPI(context.Background(), "https://deepseek.de/", "0xabc", c)
+	if err != nil {
+		t.Fatalf("solve: %v", err)
+	}
+	if token != "tok-123" {
+		t.Fatalf("token = %q", token)
+	}
+	if gotBody["sitekey"] != "0xabc" || gotBody["siteurl"] != "https://deepseek.de/" {
+		t.Fatalf("request body = %v", gotBody)
+	}
+	if gotBody["timeout"] != float64(30) {
+		t.Fatalf("timeout = %v", gotBody["timeout"])
 	}
 }

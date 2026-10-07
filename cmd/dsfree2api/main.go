@@ -86,6 +86,12 @@ func main() {
 
 	up := upstream.New(cfg, ts, logger, pool)
 
+	// Cookie pool: keep one verified session per site × route ahead of time,
+	// so API requests never wait for a solve. No-op unless warm_enabled.
+	warmCtx, warmCancel := context.WithCancel(context.Background())
+	defer warmCancel()
+	ts.StartWarmer(warmCtx, func() []turnstile.WarmTarget { return warmTargets(cfg, up, pool) })
+
 	apiSrv := api.New(cfg, up, met, logs, ts, logger)
 	adminSrv := admin.New(cfg, up, met, logs, ts, logger, pool)
 
@@ -141,6 +147,48 @@ func main() {
 	}
 	met.Close()
 	logger.Info("bye")
+}
+
+// warmTargets builds the site × route matrix the cookie pool keeps fresh:
+// the sticky proxy-pool pick first, then the global primary/fallback lines.
+// A site with warm_pool_only skips the global lanes and warms only its bound
+// pool routes (request-time failover to the global lanes is unaffected).
+func warmTargets(cfg *config.Config, up *upstream.Client, pool *proxypool.Manager) []turnstile.WarmTarget {
+	routes := up.Routes()
+	cfg.RLock()
+	sites := make([]config.Site, 0, len(cfg.Sites))
+	for _, st := range cfg.Sites {
+		if st != nil && st.Enabled {
+			sites = append(sites, *st)
+		}
+	}
+	cfg.RUnlock()
+	out := make([]turnstile.WarmTarget, 0, len(routes)*len(sites))
+	seen := map[string]bool{}
+	add := func(site config.Site, proxy string) {
+		key := site.Code + "|" + proxy
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, turnstile.WarmTarget{Site: site, Proxy: proxy})
+	}
+	for _, site := range sites {
+		if pool != nil {
+			if cands := pool.Candidates(site.Code); len(cands) > 0 {
+				add(site, cands[0].Proxy)
+			}
+		}
+		// warm_pool_only sites keep their cookie pool on the bound pool
+		// routes; the global lanes stay unwarmed.
+		if site.WarmPoolOnly {
+			continue
+		}
+		for _, r := range routes {
+			add(site, r.Proxy)
+		}
+	}
+	return out
 }
 
 func countModels(cfg *config.Config) int {

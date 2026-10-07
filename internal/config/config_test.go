@@ -100,6 +100,11 @@ func TestValidateRejectsBadValues(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Error("expected error for empty turnstile api_key")
 	}
+	cfg.Turnstile.APIStyle = "ezsolver"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("ezsolver style without api_key: %v", err)
+	}
+	cfg.Turnstile.APIStyle = ""
 	cfg.Turnstile.APIKey = "k"
 	cfg.Turnstile.Enabled = false
 	cfg.Admin.Port = cfg.Server.Port

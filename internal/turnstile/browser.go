@@ -467,10 +467,7 @@ const uaMetadataExpr = `(() => {
 // warms the page like a human, renders the widget and clicks until a token
 // lands or the deadline passes.
 func (s *Solver) pollForToken(ctx context.Context, conn *cdp, sid, sitekey string, cfg config.Turnstile) (string, error) {
-	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 90 * time.Second
-	}
+	timeout := time.Duration(cfg.SolveTimeoutValue()) * time.Second
 	deadline := time.Now().Add(timeout)
 
 	var preDone, inited bool
