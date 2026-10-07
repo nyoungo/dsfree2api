@@ -335,3 +335,43 @@ func TestTryParseToolCallsShortCloseSequence(t *testing.T) {
 		t.Fatalf("content = %q, want html", obj.Content)
 	}
 }
+
+func TestTryParseToolCallsLeakedQuoteCutoff(t *testing.T) {
+	raw := `{"tool_calls": [{"id": "call_001", "type": "function", "function": {"name": "write", "arguments": "{\"filePath\": \"tihu.html\", \"content\": \"<html><body>canvas scene leak "and then cut`
+	_, calls, ok := TryParseToolCalls(raw)
+	if !ok {
+		t.Fatal("TryParseToolCalls ok = false, want force-closed tool call")
+	}
+	args := calls[0].Function.Arguments
+	if !json.Valid([]byte(args)) {
+		t.Fatalf("args invalid after force close: %s", args)
+	}
+	var inner struct {
+		FilePath string `json:"filePath"`
+		Content  string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(args), &inner); err != nil {
+		t.Fatal(err)
+	}
+	if inner.FilePath != "tihu.html" {
+		t.Fatalf("filePath = %q", inner.FilePath)
+	}
+	if !strings.Contains(inner.Content, "canvas scene leak") || !strings.Contains(inner.Content, `"and then cut`) {
+		t.Fatalf("content lost pre-cut text: %q", inner.Content)
+	}
+}
+
+func TestTryParseToolCallsPlainCutoffReturnsPartial(t *testing.T) {
+	raw := `{"tool_calls": [{"id": "c", "type": "function", "function": {"name": "write", "arguments": "{\"filePath\": \"a.html\", \"content\": \"<html><body><canvas id=\"scene\">stopped mid`
+	_, calls, ok := TryParseToolCalls(raw)
+	if !ok {
+		t.Fatal("TryParseToolCalls ok = false, want partial tool call")
+	}
+	args := calls[0].Function.Arguments
+	if !json.Valid([]byte(args)) {
+		t.Fatalf("args invalid: %s", args)
+	}
+	if !strings.Contains(args, "stopped mid") {
+		t.Fatalf("args lost tail: %s", args)
+	}
+}

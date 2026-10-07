@@ -76,6 +76,15 @@ func TryParseToolCalls(text string) (string, []ToolCall, bool) {
 						}
 					}
 					if !json.Valid([]byte(args)) {
+						// Last resort: the reply leaked a raw quote or got
+						// cut mid-escape — re-anchor on the final string
+						// literal and rebuild so the client still receives
+						// a tool call with whatever content survived.
+						if closed, ok := forceCloseJSON(s); ok {
+							args = closed
+						}
+					}
+					if !json.Valid([]byte(args)) {
 						bad = true
 						break
 					}
@@ -131,6 +140,11 @@ func decodeToolPayload(cand string, payload any) bool {
 	}
 	if prefix, ok := jsonPrefix(cand); ok {
 		if err := json.Unmarshal([]byte(prefix), payload); err == nil {
+			return true
+		}
+	}
+	if closed, ok := forceCloseJSON(cand); ok {
+		if err := json.Unmarshal([]byte(closed), payload); err == nil {
 			return true
 		}
 	}
