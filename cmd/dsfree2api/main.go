@@ -5,10 +5,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/nyoungo/dsfree2api/internal/api"
 	"github.com/nyoungo/dsfree2api/internal/config"
 	"github.com/nyoungo/dsfree2api/internal/logbuf"
+	"github.com/nyoungo/dsfree2api/internal/logfile"
 	"github.com/nyoungo/dsfree2api/internal/metrics"
 	"github.com/nyoungo/dsfree2api/internal/proxypool"
 	"github.com/nyoungo/dsfree2api/internal/turnstile"
@@ -58,18 +61,20 @@ func main() {
 		return
 	}
 
-	level := parseLevel(cfg.Server.LogLevel)
-	logs := logbuf.New(500)
-	logger := slog.New(logbuf.NewHandler(
-		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}),
-		logs,
-	))
-
 	dataDir, err := cfg.DataDir()
 	if err != nil {
-		logger.Error("cannot create data dir", "error", err)
+		fmt.Fprintf(os.Stderr, "cannot create data dir: %v\n", err)
 		os.Exit(1)
 	}
+
+	level := parseLevel(cfg.Server.LogLevel)
+	logs := logbuf.New(500)
+	sinks, closeLog := logSink(cfg, dataDir)
+	defer closeLog()
+	logger := slog.New(logbuf.NewHandler(
+		slog.NewTextHandler(sinks, &slog.HandlerOptions{Level: level}),
+		logs,
+	))
 
 	met := metrics.New(dataDir)
 	met.Start()
@@ -147,6 +152,25 @@ func main() {
 	}
 	met.Close()
 	logger.Info("bye")
+}
+
+// logSink opens the daily file log (default <data_dir>/logs/dsfree2api.log)
+// and returns the combined writer plus its close function. `log_file = "-"`
+// disables file logging; a setup failure degrades to stderr only.
+func logSink(cfg *config.Config, dataDir string) (io.Writer, func()) {
+	path := strings.TrimSpace(cfg.Server.LogFile)
+	if path == "-" {
+		return os.Stderr, func() {}
+	}
+	if path == "" {
+		path = filepath.Join(dataDir, "logs", "dsfree2api.log")
+	}
+	w, err := logfile.New(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log file disabled: %v\n", err)
+		return os.Stderr, func() {}
+	}
+	return io.MultiWriter(os.Stderr, w), func() { _ = w.Close() }
 }
 
 // warmTargets builds the site × route matrix the cookie pool keeps fresh:

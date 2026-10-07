@@ -1,6 +1,6 @@
 ﻿# dsfree2api 示例配置。
 # 复制为 config.toml 后按需修改；运行 `dsfree2api -check -config config.toml` 可校验。
-# 环境变量优先级高于本文件：HOST PORT LOG_LEVEL API_KEYS PROXY_URL PROXY_FALLBACK_URLS
+# 环境变量优先级高于本文件：HOST PORT LOG_LEVEL LOG_FILE API_KEYS PROXY_URL PROXY_FALLBACK_URLS
 # PROXY_SLOW_START_SECONDS TURNSTILE_ENABLED TURNSTILE_API_KEY TURNSTILE_PROVIDER
 # TURNSTILE_BROWSER_PATH TURNSTILE_TIMEOUT_SECONDS TURNSTILE_WARM_ENABLED
 # TURNSTILE_WARM_RATIO TURNSTILE_WARM_CHECK_SECONDS
@@ -10,6 +10,9 @@
 host = "0.0.0.0"
 port = 8000
 log_level = "INFO"
+# 日志文件：留空写入 <data_dir>/logs/dsfree2api.log；填路径则写到该文件；
+# "-" = 仅终端。日志按天轮转，旧文件压缩为 <名称>-YYYY-MM-DD.log.gz。
+log_file = ""
 
 [security]
 # 下游鉴权。空数组 = 不鉴权；建议部署时换成自己的 key。

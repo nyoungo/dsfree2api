@@ -39,7 +39,7 @@ Go 实现，编译为**单个静态二进制**，无运行时依赖；内置 **W
 - **Turnstile 自动突破**：三种 Token 获取方式 — 求解服务 API（`provider="api"`）、本地浏览器自动求解（`provider="browser"`，CDP 直连 Chrome/Edge，无需 Playwright/Docker）、手动导入 Cookie（`provider="manual"`）；结果按「代理线路 × 站点」缓存，TTL 过期自动重解
 - **会话自愈**：nonce / data-config 缓存 + 配额耗尽 / 验证失败时自动刷新重试
 - **Web 管理台**：仪表盘、模型与站点、API Key、代理线路、Turnstile、对话调试、实时日志、设置
-- **可观测**：按模型 / 站点 / 按日统计、P50/P95 延迟、最近请求、实时日志（SSE），数据持久化到 `data/`
+- **可观测**：按模型 / 站点 / 按日统计、P50/P95 延迟、最近请求、实时日志（SSE）、文件日志按日压缩轮转，数据持久化到 `data/`
 - **安全**：下游 Bearer / `X-Api-Key` 鉴权、每 Key 每分钟限流、每站点并发闸门、管理台独立口令
 
 ---
@@ -135,7 +135,7 @@ dsfree2api -config config.toml -check
 
 | 字段 | 说明 |
 |------|------|
-| `[server]` | API 监听 `host` / `port` / `log_level` |
+| `[server]` | API 监听 `host` / `port` / `log_level` / `log_file`（留空写数据目录，按日压缩轮转；`-` = 仅终端） |
 | `[security].api_keys` | 下游鉴权，空数组 = 不鉴权 |
 | `[admin]` | 管理台 `enabled` / `host` / `port` / `password`（留空启动时生成随机密码） |
 | `[limits]` | `max_concurrent_per_site` 每站点并发、`rate_per_minute` 每 Key 每分钟限流（0 = 不限） |
@@ -285,6 +285,7 @@ curl http://127.0.0.1:8000/v1/messages \
 |------|------|------|
 | `HOST` / `PORT` | API 监听地址 | `0.0.0.0` / `8000` |
 | `LOG_LEVEL` | `DEBUG` `INFO` `WARN` `ERROR` | `INFO` |
+| `LOG_FILE` | 日志文件路径；留空 = `<data_dir>/logs/dsfree2api.log`，`-` = 仅终端 | —（文件日志） |
 | `API_KEYS` | 下游 key，逗号分隔 | —（不鉴权） |
 | `PROXY_URL` | 主代理 | —（直连） |
 | `PROXY_FALLBACK_URLS` | 备用代理，逗号分隔 | — |

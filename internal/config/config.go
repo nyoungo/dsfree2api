@@ -187,6 +187,8 @@ type Config struct {
 		Host     string `toml:"host" json:"host"`
 		Port     int    `toml:"port" json:"port"`
 		LogLevel string `toml:"log_level" json:"log_level"`
+		// LogFile: "" = <data_dir>/logs/dsfree2api.log, "-" = stderr only.
+		LogFile string `toml:"log_file" json:"log_file"`
 	} `toml:"server" json:"server"`
 
 	Security struct {
@@ -472,6 +474,9 @@ func (c *Config) applyEnv() error {
 	}
 	if v := str("LOG_LEVEL"); v != nil {
 		c.Server.LogLevel = *v
+	}
+	if v := str("LOG_FILE"); v != nil {
+		c.Server.LogFile = strings.TrimSpace(*v)
 	}
 	if v := str("PORT"); v != nil {
 		n, err := strconv.Atoi(strings.TrimSpace(*v))
