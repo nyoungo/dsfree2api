@@ -938,6 +938,10 @@ func launchBrowser(ctx context.Context, exe string, cfg config.Turnstile, locale
 		"--user-data-dir=" + profile,
 		"--no-first-run",
 		"--no-default-browser-check",
+		// Chromium/Edge re-launch themselves de-elevated when the parent runs
+		// as Administrator, orphaning the real browser and breaking CDP;
+		// keep the browser inside our process tree instead.
+		"--do-not-de-elevate",
 		"--disable-blink-features=AutomationControlled",
 		"--disable-background-networking",
 		"--disable-sync",
@@ -989,13 +993,12 @@ func (b *browserProc) waitDevTools(ctx context.Context) error {
 	deadline := time.Now().Add(30 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		select {
-		case <-b.exited:
-			return fmt.Errorf("browser exited early (%v): %s", b.waitErr, b.stderr.String())
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		default:
 		}
+		// A Windows browser launcher may hand off to a longer-lived process
+		// and exit 0; that is not a failure while the DevTools endpoint is
+		// still coming up, so the exit check happens only at timeout.
 		resp, err := client.Get(endpoint)
 		if err == nil {
 			body, _ := io.ReadAll(resp.Body)
@@ -1015,10 +1018,17 @@ func (b *browserProc) waitDevTools(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	select {
+	case <-b.exited:
+		return fmt.Errorf("browser exited early (%v): %s", b.waitErr, b.stderr.String())
+	default:
+	}
 	return fmt.Errorf("devtools never came up: %v; stderr: %s", lastErr, b.stderr.String())
 }
 
 // Close kills the browser if it is still alive and drops the temp profile.
+// On Windows the spawned launcher may have exited while the real browser
+// lives on, so a DevTools close is attempted before giving up.
 func (b *browserProc) Close() {
 	select {
 	case <-b.exited:
@@ -1031,6 +1041,7 @@ func (b *browserProc) Close() {
 		case <-time.After(3 * time.Second):
 		}
 	}
+	b.closeViaDevTools(2 * time.Second)
 	if b.tempDir != "" {
 		for i := 0; i < 3; i++ {
 			if err := os.RemoveAll(b.tempDir); err == nil {
@@ -1039,6 +1050,39 @@ func (b *browserProc) Close() {
 			time.Sleep(300 * time.Millisecond)
 		}
 	}
+}
+
+// closeViaDevTools asks the browser to shut down over the DevTools endpoint.
+// It is the only handle left when the original launcher process has exited.
+func (b *browserProc) closeViaDevTools(timeout time.Duration) {
+	ws := b.wsURL
+	if ws == "" {
+		client := &http.Client{Timeout: timeout}
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", b.port))
+		if err != nil {
+			return
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+		var info struct {
+			WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+		}
+		if json.Unmarshal(body, &info) != nil || info.WebSocketDebuggerURL == "" {
+			return
+		}
+		ws = info.WebSocketDebuggerURL
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := dialCDP(ctx, ws, fmt.Sprintf("http://127.0.0.1:%d", b.port))
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_, _ = conn.call(ctx, "", "Browser.close", nil)
 }
 
 func freePort() (int, error) {
