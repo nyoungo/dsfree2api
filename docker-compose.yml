@@ -1,0 +1,23 @@
+services:
+  dsfree2api:
+    build: .
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      # Web console listens on 127.0.0.1 by default; expose it to reach it
+      # from outside the container (put a reverse proxy in front of it).
+      ADMIN_HOST: 0.0.0.0
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      TURNSTILE_API_KEY: ${TURNSTILE_API_KEY:-}
+      API_KEYS: ${API_KEYS:-}
+      PROXY_URL: ${PROXY_URL:-}
+      PROXY_FALLBACK_URLS: ${PROXY_FALLBACK_URLS:-}
+      PROXY_SLOW_START_SECONDS: ${PROXY_SLOW_START_SECONDS:-8}
+    volumes:
+      - ./data:/app/data
+      # 先执行: cp config.example.toml config.toml
+      - ./config.toml:/app/config.toml
+    restart: unless-stopped

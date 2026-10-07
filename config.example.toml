@@ -1,0 +1,137 @@
+﻿# dsfree2api 示例配置。
+# 复制为 config.toml 后按需修改；运行 `dsfree2api -check -config config.toml` 可校验。
+# 环境变量优先级高于本文件：HOST PORT LOG_LEVEL API_KEYS PROXY_URL PROXY_FALLBACK_URLS
+# PROXY_SLOW_START_SECONDS TURNSTILE_ENABLED TURNSTILE_API_KEY TURNSTILE_PROVIDER
+# TURNSTILE_BROWSER_PATH ADMIN_ENABLED ADMIN_HOST ADMIN_PORT ADMIN_PASSWORD DATA_DIR
+
+[server]
+host = "0.0.0.0"
+port = 8000
+log_level = "INFO"
+
+[security]
+# 下游鉴权。空数组 = 不鉴权；建议部署时换成自己的 key。
+api_keys = ["sk-dsfr-local-change-me"]
+
+[admin]
+enabled = true
+host = "127.0.0.1"
+port = 8001
+# 留空时启动会生成一次性随机密码并打印到日志。
+password = "admin123"
+
+[limits]
+# 同一站点的并发上游请求数；rate_per_minute = 0 表示不限流。
+max_concurrent_per_site = 4
+rate_per_minute = 0
+
+[proxy]
+# 主线路，支持 http:// / https:// / socks5://，留空则直连。
+url = ""
+# 主线路失败或 slow-start 超时后依次尝试的备用线路。
+fallback_urls = []
+# 主线路允许的首事件等待秒数（>0 且存在备用线路时生效）。
+slow_start_seconds = 8
+
+[upstream]
+timeout = 60.0
+stream_timeout = 300.0
+config_ttl_seconds = 60
+auto_refresh = true
+refresh_retries = 4
+retry_backoff_seconds = 1.0
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+# 本站点配额耗尽时自动切换到其他站点的同款模型。
+cross_site_failover = true
+
+[turnstile]
+# 默认关闭，且不内置任何求解服务。Token 获取方式三选一（provider）：
+#   api     —— 调用你自己的求解服务 API（需 api_url / api_key，方式 1）
+#   browser —— 用本机浏览器自动求解（需 browser_path，方式 2）
+#   manual  —— 只用控制台手动导入的 Cookie（方式 3）
+enabled = false
+provider = "api"
+# 方式 1：求解服务 API
+# api_url = "https://your-solver.example.com/turnstile/sync"
+# api_key = "REPLACE_ME"
+# 方式 2：本地浏览器自动获取（CDP 直连，无需 Playwright / Docker）
+# browser_path = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+# browser_headless = false              # 默认有头窗口，过验证率更高
+# browser_user_data_dir = ""            # 可选：指向已有 profile（需先关掉正在运行的浏览器）
+# browser_timezone = ""                 # 可选：时区，与代理出口对齐，如 "Asia/Tokyo"
+# browser_locale = ""                   # 可选：如 "ja-JP"，留空取站点语言
+sitekey = "0x4AAAAAADlLZ3ljqZP6cQwq"
+action = "chat"
+timeout_seconds = 90
+cookie_ttl_seconds = 10800
+retries = 5
+retry_backoff_seconds = 1.5
+
+[runtime]
+data_dir = "./data"
+
+[sites.de]
+base_url = "https://deepseek.de"
+ajax_url = "https://deepseek.de/wp-admin/admin-ajax.php"
+sitekey = "0x4AAAAAADlLZ3ljqZP6cQwq"
+language = "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+
+[sites.es]
+base_url = "https://deepseek.es"
+ajax_url = "https://deepseek.es/wp-admin/admin-ajax.php"
+sitekey = "0x4AAAAAADlLZ3ljqZP6cQwq"
+language = "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7"
+
+[sites.fr]
+base_url = "https://deepseek.fr"
+ajax_url = "https://deepseek.fr/wp-admin/admin-ajax.php"
+sitekey = "0x4AAAAAADlLZ3ljqZP6cQwq"
+language = "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
+
+[models.deepseek-v4-flash-de]
+site = "de"
+upstream_id = "deepseek-v4-flash"
+label = "DeepSeek V4-Flash DE"
+page_path = "/"
+bot_id = 27487
+post_id = 106
+
+[models.deepseek-v4-pro-de]
+site = "de"
+upstream_id = "deepseek-v4-pro"
+label = "DeepSeek V4-Pro DE"
+page_path = "/pro/"
+bot_id = 27533
+post_id = 27177
+
+[models.deepseek-v4-flash-es]
+site = "es"
+upstream_id = "deepseek-v4-flash"
+label = "DeepSeek V4-Flash ES"
+page_path = "/"
+bot_id = 27623
+post_id = 27568
+
+[models.deepseek-v4-pro-es]
+site = "es"
+upstream_id = "deepseek-v4-pro"
+label = "DeepSeek V4-Pro ES"
+page_path = "/pro/"
+bot_id = 27637
+post_id = 27615
+
+[models.deepseek-v4-flash-fr]
+site = "fr"
+upstream_id = "deepseek-v4-flash"
+label = "DeepSeek V4-Flash FR"
+page_path = "/"
+bot_id = 27645
+post_id = 27569
+
+[models.deepseek-v4-pro-fr]
+site = "fr"
+upstream_id = "deepseek-v4-pro"
+label = "DeepSeek V4-Pro FR"
+page_path = "/pro/"
+bot_id = 27647
+post_id = 27616

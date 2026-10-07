@@ -1,0 +1,6 @@
+.git
+bin/
+data/
+*.log
+*.exe
+config.toml

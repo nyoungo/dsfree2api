@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsfree2api 控制台</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+</head>
+<body>
+
+<div id="login" class="overlay hidden">
+  <div class="login-card">
+    <div class="login-brand">dsfree2api</div>
+    <div class="login-sub">管理控制台</div>
+    <input id="login-password" type="password" placeholder="管理员密码" autocomplete="current-password">
+    <button id="login-btn" class="btn primary block">登录</button>
+    <div id="login-error" class="login-error"></div>
+    <div class="login-hint">密码来自 <code>admin.password</code> 或 <code>ADMIN_PASSWORD</code>；未配置时启动日志会打印一次性密码。</div>
+  </div>
+</div>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">⚡</span>
+      <span>dsfree2api</span>
+    </div>
+    <nav id="nav">
+      <a href="#/dashboard"  data-page="dashboard">仪表盘</a>
+      <a href="#/models"     data-page="models">模型与站点</a>
+      <a href="#/keys"       data-page="keys">API Key</a>
+      <a href="#/proxy"      data-page="proxy">代理线路</a>
+      <a href="#/turnstile"  data-page="turnstile">Turnstile</a>
+      <a href="#/playground" data-page="playground">对话调试</a>
+      <a href="#/logs"       data-page="logs">实时日志</a>
+      <a href="#/settings"   data-page="settings">设置</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div id="sys-version">v—</div>
+      <button id="logout-btn" class="btn ghost small">退出登录</button>
+    </div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div id="page-title" class="page-title">仪表盘</div>
+      <div id="sys-badges" class="badges"></div>
+    </header>
+    <section id="view" class="view"></section>
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
