@@ -5,6 +5,7 @@ package turnstile
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -158,6 +159,64 @@ func (s *Solver) Invalidate(siteCode string) {
 	}
 }
 
+// guestCookieName is the cookie the upstream guest-token plugin keys a
+// visitor's free daily tier to (verified against the live endpoints: the
+// balance API echoes it as "gid" and accepts any freshly minted value).
+const guestCookieName = "dsgt_gid"
+
+// guestIDAlphabet matches the 32-char ids the site itself issues.
+const guestIDAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+// randomGuestID mints a visitor id in the same shape the site uses.
+func randomGuestID() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("g%d", time.Now().UnixNano())
+	}
+	for i := range b {
+		b[i] = guestIDAlphabet[int(b[i])%len(guestIDAlphabet)]
+	}
+	return string(b)
+}
+
+// RotateGuest swaps the visitor cookie inside every cached session for the
+// site. The upstream grants each fresh visitor id its own daily free tier —
+// the same effect as opening a new private window — so a quota-exhausted
+// site recovers without paying for a Turnstile re-solve. Returns the new id,
+// or "" when the site has no live cached session to rotate.
+func (s *Solver) RotateGuest(siteCode string) string {
+	gid := randomGuestID()
+	s.mu.Lock()
+	cores := make([]*core, 0, len(s.cores))
+	for _, c := range s.cores {
+		cores = append(cores, c)
+	}
+	s.mu.Unlock()
+	rotated := false
+	for _, c := range cores {
+		c.mu.Lock()
+		if st, ok := c.cache[siteCode]; ok && time.Now().Before(st.expiresAt) {
+			st.cookies[guestCookieName] = gid
+			rotated = true
+		}
+		c.mu.Unlock()
+	}
+	if !rotated {
+		return ""
+	}
+	return gid
+}
+
+// GuestID reports the visitor id cached for the site on one proxy route.
+func (s *Solver) GuestID(siteCode, proxy string) (string, bool) {
+	ck := s.coreFor(proxy).load(siteCode)
+	if ck == nil {
+		return "", false
+	}
+	gid := ck[guestCookieName]
+	return gid, gid != ""
+}
+
 // ImportCookies stores cookies exported from a browser session that already
 // passed the Turnstile check, so chat works while [turnstile] is off or the
 // solver service is down. Cookies are bound to the IP/UA that obtained them,
@@ -211,8 +270,8 @@ func ParseCookiePairs(raw string) map[string]string {
 // [turnstile] switch is off; only the solving step needs the switch.
 func (s *Solver) ApplyValidCookies(ctx context.Context, sess httpx.Session, site *config.Site, proxy string) error {
 	c := s.coreFor(proxy)
-	if st := c.load(site.Code); st != nil {
-		sess.SetCookies(st.cookies)
+	if ck := c.load(site.Code); ck != nil {
+		sess.SetCookies(ck)
 		return nil
 	}
 	if !s.Enabled() {
@@ -221,8 +280,8 @@ func (s *Solver) ApplyValidCookies(ctx context.Context, sess httpx.Session, site
 	l := c.lockFor(site.Code)
 	l.Lock()
 	defer l.Unlock()
-	if st := c.load(site.Code); st != nil {
-		sess.SetCookies(st.cookies)
+	if ck := c.load(site.Code); ck != nil {
+		sess.SetCookies(ck)
 		return nil
 	}
 	return s.refreshLocked(ctx, sess, site, c)
@@ -240,14 +299,20 @@ func (s *Solver) Refresh(ctx context.Context, sess httpx.Session, site *config.S
 	return s.refreshLocked(ctx, sess, site, c)
 }
 
-func (c *core) load(site string) *cookieState {
+// load returns a copy of the cached cookies, or nil when absent or expired.
+// Callers get a snapshot, so RotateGuest can swap entries concurrently.
+func (c *core) load(site string) map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st, ok := c.cache[site]
 	if !ok || time.Now().After(st.expiresAt) {
 		return nil
 	}
-	return st
+	out := make(map[string]string, len(st.cookies))
+	for k, v := range st.cookies {
+		out[k] = v
+	}
+	return out
 }
 
 func (s *Solver) refreshLocked(ctx context.Context, sess httpx.Session, site *config.Site, c *core) error {

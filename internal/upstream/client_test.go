@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/nyoungo/dsfree2api/internal/config"
+	"github.com/nyoungo/dsfree2api/internal/httpx"
+	"github.com/nyoungo/dsfree2api/internal/turnstile"
 )
 
 const examplePath = "../../config.example.toml"
@@ -334,5 +336,42 @@ func TestCacheEmptyFailsOverToMirrorWithoutRefreshCycles(t *testing.T) {
 	}
 	if calls["es"]+calls["fr"] == 0 {
 		t.Fatal("mirror was not attempted after cache rejection")
+	}
+}
+
+func TestQuotaRotationRecoversWithoutSolve(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Upstream.AutoRefresh = true
+	cfg.Upstream.RefreshRetries = 3
+	solver := turnstile.New(cfg.Turnstile, httpx.DefaultUserAgent)
+	const oldGid = "OLDGIDOLDGIDOLDGIDOLDGIDOLDG12"
+	if _, _, err := solver.ImportCookies("de", "cf_clearance=abc; dsgt_gid="+oldGid, ""); err != nil {
+		t.Fatalf("seed cookies: %v", err)
+	}
+	c := New(cfg, solver, nil)
+	calls := 0
+	c.chatOnceOverride = func(_ context.Context, site config.Site, modelID string, model config.Model,
+		_ string, _ Route, _ *ServeInfo, _ func(Event) error) error {
+		calls++
+		if calls == 1 {
+			return newQuota("sse quota exhausted: test")
+		}
+		return nil
+	}
+	if err := c.Chat(context.Background(), "deepseek-v4-flash-de", "p", nil, func(Event) error { return nil }); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("chat calls = %d, want 2 (quota then success)", calls)
+	}
+	gid, ok := solver.GuestID("de", "")
+	if !ok {
+		t.Fatal("guest id lost after rotation")
+	}
+	if gid == oldGid {
+		t.Fatal("visitor id was not rotated after the quota error")
+	}
+	if c.quotaCooled("de") {
+		t.Error("cooldown should be cleared once the site serves again")
 	}
 }

@@ -192,3 +192,50 @@ func TestHistoryIsCappedAndRecorded(t *testing.T) {
 		t.Error("last record should be OK")
 	}
 }
+
+func TestRotateGuestSwapsVisitorID(t *testing.T) {
+	cfg, err := config.Load(examplePath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	solver := New(cfg.Turnstile, httpx.DefaultUserAgent)
+	const oldGid = "OLDGIDOLDGIDOLDGIDOLDGIDOLDG12"
+	if _, _, err := solver.ImportCookies("de", "cf_clearance=abc; dsgt_gid="+oldGid, ""); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	gid, ok := solver.GuestID("de", "")
+	if !ok || gid != oldGid {
+		t.Fatalf("GuestID = %q %v, want %q", gid, ok, oldGid)
+	}
+	sess := &fakeSession{}
+	if err := solver.ApplyValidCookies(context.Background(), sess, cfg.Sites["de"], ""); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if sess.Cookies()["dsgt_gid"] != oldGid {
+		t.Fatalf("session gid = %q, want the cached %q", sess.Cookies()["dsgt_gid"], oldGid)
+	}
+
+	rotated := solver.RotateGuest("de")
+	if rotated == "" {
+		t.Fatal("RotateGuest returned empty for a live session")
+	}
+	if rotated == oldGid {
+		t.Fatal("RotateGuest kept the old id")
+	}
+	if len(rotated) != 32 {
+		t.Errorf("rotated id length = %d, want 32", len(rotated))
+	}
+	if got, _ := solver.GuestID("de", ""); got != rotated {
+		t.Errorf("GuestID after rotate = %q, want %q", got, rotated)
+	}
+	sess2 := &fakeSession{}
+	if err := solver.ApplyValidCookies(context.Background(), sess2, cfg.Sites["de"], ""); err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	if sess2.Cookies()["dsgt_gid"] != rotated {
+		t.Errorf("fresh session gid = %q, want rotated %q", sess2.Cookies()["dsgt_gid"], rotated)
+	}
+	if got := solver.RotateGuest("no-such-site"); got != "" {
+		t.Errorf("rotating an unknown site returned %q, want empty", got)
+	}
+}

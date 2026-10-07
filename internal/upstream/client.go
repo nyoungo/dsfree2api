@@ -156,6 +156,43 @@ func (c *Client) sortQuotaCoolLast(ids []string) []string {
 	return append(rest, cooled...)
 }
 
+// clearQuotaCool lifts a site's cooldown once it serves again after a quota
+// error — the fresh visitor identity restored its daily tier.
+func (c *Client) clearQuotaCool(code string) {
+	c.stateMu.Lock()
+	_, ok := c.quotaCool[code]
+	if ok {
+		delete(c.quotaCool, code)
+	}
+	c.stateMu.Unlock()
+	if ok {
+		c.log.Info("site quota restored", "site", code)
+	}
+}
+
+// probeBalanceAsync logs the site's current free tier after a quota
+// recovery. Best effort — failures only show up at DEBUG.
+func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route Route) {
+	if c.ts == nil {
+		return
+	}
+	gid, ok := c.ts.GuestID(site.Code, route.Proxy)
+	if !ok {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		bal, err := c.FetchBalance(ctx, site, gid, model.BotID, route)
+		if err != nil {
+			c.log.Debug("balance probe failed", "site", site.Code, "error", err)
+			return
+		}
+		c.log.Info("site balance", "site", site.Code,
+			"remaining", bal.Free.Remaining, "limit", bal.Free.Limit)
+	}()
+}
+
 // logUpstreamErr records one failed upstream attempt. Quota errors cool the
 // site down and repeats of an identical error inside a short window drop to
 // DEBUG, so a balance-starved site neither taxes every continuation round
@@ -321,12 +358,17 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 	routes := c.Routes()
 
 	var lastErr error
+	sawQuota := false
 	for attempt := 0; ; attempt++ {
 		var failed []Route
 		for i, route := range routes {
 			allowSlow := i == 0 && len(routes) > 1
 			err := c.chatOnceSlowStart(ctx, site, modelID, model, prompt, route, allowSlow, info, yield)
 			if err == nil {
+				if sawQuota {
+					c.clearQuotaCool(site.Code)
+					c.probeBalanceAsync(site, model, route)
+				}
 				return nil
 			}
 			lastErr = err
@@ -358,6 +400,9 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 			}
 			failed = append(failed, route)
 			c.logUpstreamErr(site.Code, modelID, attempt, route, err)
+			if isQuota(err) {
+				sawQuota = true
+			}
 			if i < len(routes)-1 {
 				continue
 			}
@@ -384,6 +429,15 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 			// first cycle retries cheaply and only the second one pays for
 			// a Turnstile re-solve.
 			forceCookie := isSession(lastErr) || (isQuota(lastErr) && attempt >= 1)
+			// The free daily tier is keyed to the visitor cookie: swapping
+			// in a brand-new visitor id restores it instantly, the same
+			// effect as a fresh private window. Only a re-solve (attempt
+			// >= 1) then remains as the slower fallback.
+			if isQuota(lastErr) && attempt == 0 && c.ts != nil {
+				if gid := c.ts.RotateGuest(site.Code); gid != "" {
+					c.log.Info("rotated visitor identity", "site", site.Code, "reason", "quota")
+				}
+			}
 			for _, route := range failed {
 				if err := c.refreshSession(ctx, site, modelID, route, forceCookie); err != nil {
 					c.log.Warn("session refresh failed", "model", modelID, "error", err)
