@@ -64,7 +64,13 @@ func ToolCallTruncated(text string) bool {
 		}
 	}
 	if !strings.HasPrefix(cand, `{"tool_calls"`) {
-		return false
+		// The model sometimes opens with a sentence before the tool JSON:
+		// evaluate the payload itself, mirroring TryParseToolCalls.
+		i := strings.Index(cand, `{"tool_calls"`)
+		if i <= 0 {
+			return false
+		}
+		cand = cand[i:]
 	}
 	return !json.Valid([]byte(cand))
 }
@@ -118,8 +124,22 @@ func (st *escapeState) feed(s string, out *strings.Builder) {
 		}
 		switch c {
 		case '\\':
-			st.escaped = true
-			out.WriteByte(c)
+			if i+1 >= len(s) {
+				// dangling escape: carried into the next feed so a
+				// continuation piece can complete it
+				st.escaped = true
+				out.WriteByte('\\')
+				continue
+			}
+			if j := escapeEndAt(s, i); j > i {
+				out.WriteString(s[i : j+1])
+				i = j
+				continue
+			}
+			// invalid escape (…\d): double the backslash so the text
+			// parses — matches escapeStringBody used by forceCloseJSON,
+			// keeping streamed and repaired arguments identical
+			out.WriteString(`\\`)
 		case '"':
 			st.inString = false
 			out.WriteByte(c)
@@ -140,9 +160,35 @@ func (st *escapeState) feed(s string, out *strings.Builder) {
 }
 
 func needsEscape(s string) bool {
+	inString, escaped := false, false
 	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 {
+		c := s[i]
+		if c < 0x20 {
 			return true
+		}
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			continue
+		}
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch c {
+		case '\\':
+			if i+1 >= len(s) {
+				escaped = true
+				continue
+			}
+			j := escapeEndAt(s, i)
+			if j == i {
+				return true // invalid escape — feed doubles it
+			}
+			i = j
+		case '"':
+			inString = false
 		}
 	}
 	return false

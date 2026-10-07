@@ -24,6 +24,10 @@ func TestToolCallTruncated(t *testing.T) {
 		{fenced, true},
 		{"", false},
 		{`{"other": true}`, false},
+		// prose before the payload: mirrored from TryParseToolCalls
+		{"我先说明一下：\n\n" + valid, false},
+		{"我先说明一下：\n\n" + truncated, true},
+		{"我先说明一下：\n\n" + fenced, true},
 	}
 	for _, c := range cases {
 		if got := ToolCallTruncated(c.in); got != c.want {
@@ -61,6 +65,41 @@ func TestEscapeControlChars(t *testing.T) {
 	}
 	if v.A != "line1\nline2" {
 		t.Fatalf("repaired value = %q", v.A)
+	}
+}
+
+func TestEscapeControlCharsDoublesInvalidEscapes(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// \q is not a JSON escape — the backslash must be doubled
+		{`{"a": "x\qy"}`, `{"a": "x\\qy"}`},
+		// valid pairs survive, invalid ones heal
+		{`{"a": "ok\nstill\q"}`, `{"a": "ok\nstill\\q"}`},
+		// dangling escape at the end is carried, not doubled
+		{`{"a": "dangling\`, `{"a": "dangling\`},
+		// no backslash at all: untouched
+		{`{"a": "plain"}`, `{"a": "plain"}`},
+	}
+	for _, c := range cases {
+		if got := EscapeControlChars(c.in); got != c.want {
+			t.Errorf("EscapeControlChars(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	if !json.Valid([]byte(EscapeControlChars(`{"a": "x\qy"}`))) {
+		t.Fatal("healed text is not valid JSON")
+	}
+}
+
+// TestInnerEscapeMatchesParseHeal pins the contract that keeps streamed tool
+// arguments identical to the final repaired parse.
+func TestInnerEscapeMatchesParseHeal(t *testing.T) {
+	inner := `{"content": "a\qb` + "\n" + `c\qd"}`
+	streamed := innerEscape(inner)
+	healed := EscapeControlChars(inner)
+	if streamed != healed {
+		t.Fatalf("stream/parse heal mismatch:\n stream=%q\n parse =%q", streamed, healed)
+	}
+	if !json.Valid([]byte(healed)) {
+		t.Fatalf("healed inner invalid: %q", healed)
 	}
 }
 

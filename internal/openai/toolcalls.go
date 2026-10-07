@@ -17,6 +17,9 @@ func TryParseToolCalls(text string) (string, []ToolCall, bool) {
 	var candidates []string
 	if strings.HasPrefix(trimmed, "{") {
 		candidates = append(candidates, trimmed)
+	} else if i := strings.Index(trimmed, `{"tool_calls"`); i > 0 {
+		// prose before the tool JSON: start the candidate at the payload
+		candidates = append(candidates, strings.TrimSpace(trimmed[i:]))
 	}
 	if strings.Contains(trimmed, "```json") {
 		for _, part := range strings.Split(trimmed, "```json")[1:] {
@@ -44,6 +47,11 @@ func TryParseToolCalls(text string) (string, []ToolCall, bool) {
 		}
 		if !decodeToolPayload(cand, &payload) {
 			continue
+		}
+		// A prose-prefix candidate runs to the end of the text; keep only
+		// the payload itself so prose after the JSON survives in remaining.
+		if full, ok := jsonPrefix(cand); ok && len(full) < len(cand) {
+			cand = full
 		}
 		if payload.ToolCalls == nil {
 			continue
