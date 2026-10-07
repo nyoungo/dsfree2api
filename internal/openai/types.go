@@ -97,9 +97,24 @@ type Function struct {
 }
 
 type ToolCall struct {
+	Index    *int         `json:"index,omitempty"`
 	ID       string       `json:"id"`
 	Type     string       `json:"type"`
 	Function FunctionCall `json:"function"`
+}
+
+// ToolCallDelta is one entry of a streamed tool_calls delta. Index is always
+// present; the other fields are emitted only when they carry content.
+type ToolCallDelta struct {
+	Index    int            `json:"index"`
+	ID       string         `json:"id,omitempty"`
+	Type     string         `json:"type,omitempty"`
+	Function *FunctionDelta `json:"function,omitempty"`
+}
+
+type FunctionDelta struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type FunctionCall struct {
@@ -172,9 +187,9 @@ type ChatCompletionResponse struct {
 }
 
 type ChoiceDelta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	ToolCalls []ToolCallDelta `json:"tool_calls,omitempty"`
 }
 
 type StreamChoice struct {

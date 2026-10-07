@@ -149,9 +149,105 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 		},
 	})
 
-	// When tools are requested the reply is buffered so the raw tool-call
-	// JSON is parsed once and emitted as proper function_call output items.
-	buffered := len(tools) > 0
+	// With tools the raw tool-call JSON is converted into a live
+	// function_call item stream: output_item.added once id+name are known,
+	// one function_call_arguments.delta per piece, done events at finalize.
+	var args *openai.ArgStreamer
+	if len(tools) > 0 {
+		args = openai.NewArgStreamer()
+	}
+
+	var (
+		seq     = 0
+		outIdx  = 0
+		acc     = map[int]string{} // full args seen per streamer index
+		emitted = map[int]int{}    // bytes of acc written as deltas
+		itemIDs = map[int]string{}
+		callIDs = map[int]string{}
+		fnNames = map[int]string{}
+		openIdx = -1 // streamer index of the in-progress function_call item
+		openOut = -1
+		output  []map[string]any
+	)
+	closeOpen := func() error {
+		if openIdx < 0 {
+			return nil
+		}
+		itemID := itemIDs[openIdx]
+		if err := write(map[string]any{
+			"type": "response.function_call_arguments.done", "item_id": itemID,
+			"output_index": openOut, "arguments": acc[openIdx], "sequence_number": seq,
+		}); err != nil {
+			return err
+		}
+		seq++
+		item := map[string]any{
+			"id": itemID, "type": "function_call", "status": "completed",
+			"call_id": callIDs[openIdx], "name": fnNames[openIdx], "arguments": acc[openIdx],
+		}
+		if err := write(map[string]any{
+			"type": "response.output_item.done", "output_index": openOut,
+			"sequence_number": seq, "item": item,
+		}); err != nil {
+			return err
+		}
+		seq++
+		output = append(output, item)
+		openIdx, openOut = -1, -1
+		return nil
+	}
+	onToolDelta := func(d openai.ToolArgDelta) error {
+		if d.Index < openIdx {
+			return nil // models emit calls in order — drop stale index
+		}
+		if d.ID != "" {
+			callIDs[d.Index] = d.ID
+		}
+		if d.Name != "" {
+			fnNames[d.Index] = d.Name
+		}
+		if d.Index != openIdx {
+			if err := closeOpen(); err != nil {
+				return err
+			}
+			if callIDs[d.Index] == "" || fnNames[d.Index] == "" {
+				// cannot open the item yet — hold args until id+name arrive
+				if d.Args != "" {
+					acc[d.Index] += d.Args
+				}
+				return nil
+			}
+			itemID := "fc_" + randHex(12)
+			itemIDs[d.Index] = itemID
+			openOut = outIdx
+			openIdx = d.Index
+			outIdx++
+			if err := write(map[string]any{
+				"type": "response.output_item.added", "output_index": openOut, "sequence_number": seq,
+				"item": map[string]any{
+					"id": itemID, "type": "function_call", "status": "in_progress",
+					"call_id": callIDs[d.Index], "name": fnNames[d.Index], "arguments": "",
+				},
+			}); err != nil {
+				return err
+			}
+			seq++
+		}
+		if d.Args != "" {
+			acc[d.Index] += d.Args
+		}
+		if openIdx != d.Index {
+			return nil
+		}
+		if fresh := acc[d.Index][emitted[d.Index]:]; fresh != "" {
+			emitted[d.Index] = len(acc[d.Index])
+			return write(map[string]any{
+				"type": "response.function_call_arguments.delta", "item_id": itemIDs[d.Index],
+				"output_index": openOut, "delta": fresh, "sequence_number": seq,
+			})
+		}
+		return nil
+	}
 
 	start := time.Now()
 	info := &upstream.ServeInfo{}
@@ -164,10 +260,15 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 		}
 	}, func(seg string) error {
 		text.WriteString(seg)
-		if buffered {
-			return nil
+		if args == nil {
+			return write(map[string]any{"type": "response.output_text.delta", "delta": seg})
 		}
-		return write(map[string]any{"type": "response.output_text.delta", "delta": seg})
+		for _, d := range args.Feed(text.String()) {
+			if err := onToolDelta(d); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 
 	duration := time.Since(start)
@@ -219,19 +320,67 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 	usage := estimateUsage(prompt, body)
 	outText, calls := splitToolOutput(body, tools)
 
-	stopReason := "stop"
+	var stopReason = "stop"
 	if len(calls) > 0 {
 		stopReason = "tool_use"
 	}
 
-	var output []map[string]any
-	if buffered {
-		// Replay the buffered reply as a proper item stream: message block
-		// first (when there is prose), then one function_call item per call.
-		// The final completed.response.output reuses the same item ids.
-		output = make([]map[string]any, 0, len(calls)+1)
-		seq := 0
-		outIdx := 0
+	if args == nil {
+		output = responseOutputItems(outText, calls)
+		_ = write(map[string]any{
+			"type": "response.output_text.done",
+			"text": body,
+		})
+	} else {
+		if len(calls) > 0 {
+			deltas, resend, diverged := args.Finalize(calls)
+			if diverged {
+				s.log.Warn("streamed tool arguments diverged from repaired parse", "model", req.Model, "detail", args.Diverge())
+			}
+			for _, d := range deltas {
+				_ = onToolDelta(d)
+			}
+			// close the open item with the accumulated args
+			_ = closeOpen()
+			// calls that were never streamed become full items now
+			for _, c := range resend {
+				itemID := "fc_" + randHex(12)
+				item := map[string]any{
+					"id": itemID, "type": "function_call", "status": "completed",
+					"call_id": c.ID, "name": c.Function.Name, "arguments": c.Function.Arguments,
+				}
+				_ = write(map[string]any{
+					"type": "response.output_item.added", "output_index": outIdx, "sequence_number": seq,
+					"item": map[string]any{
+						"id": itemID, "type": "function_call", "status": "in_progress",
+						"call_id": c.ID, "name": c.Function.Name, "arguments": "",
+					},
+				})
+				seq++
+				_ = write(map[string]any{
+					"type": "response.function_call_arguments.delta", "item_id": itemID,
+					"output_index": outIdx, "delta": c.Function.Arguments, "sequence_number": seq,
+				})
+				seq++
+				_ = write(map[string]any{
+					"type": "response.function_call_arguments.done", "item_id": itemID,
+					"output_index": outIdx, "arguments": c.Function.Arguments, "sequence_number": seq,
+				})
+				seq++
+				_ = write(map[string]any{
+					"type": "response.output_item.done", "output_index": outIdx,
+					"sequence_number": seq, "item": item,
+				})
+				seq++
+				outIdx++
+				output = append(output, item)
+			}
+		} else {
+			if args.Sent() {
+				s.log.Warn("tool parse failed after streaming argument deltas", "model", req.Model)
+			}
+			_ = closeOpen()
+		}
 		if outText != "" {
 			itemID := "msg_" + randHex(12)
 			item := map[string]any{
@@ -250,42 +399,12 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 			seq++
 			_ = write(map[string]any{
 				"type": "response.output_text.delta", "item_id": itemID,
-				"output_index": outIdx, "delta": outText, "content_index": 0,
+				"output_index": outIdx, "delta": outText, "content_index": 0, "sequence_number": seq,
 			})
+			seq++
 			_ = write(map[string]any{
 				"type": "response.output_text.done", "item_id": itemID,
-				"output_index": outIdx, "text": outText, "content_index": 0,
-			})
-			_ = write(map[string]any{
-				"type": "response.output_item.done", "output_index": outIdx,
-				"sequence_number": seq, "item": item,
-			})
-			seq++
-			outIdx++
-			output = append(output, item)
-		}
-		for _, c := range calls {
-			itemID := "fc_" + randHex(12)
-			item := map[string]any{
-				"id": itemID, "type": "function_call", "status": "completed",
-				"call_id": c.ID, "name": c.Function.Name, "arguments": c.Function.Arguments,
-			}
-			_ = write(map[string]any{
-				"type": "response.output_item.added", "output_index": outIdx, "sequence_number": seq,
-				"item": map[string]any{
-					"id": itemID, "type": "function_call", "status": "in_progress",
-					"call_id": c.ID, "name": c.Function.Name, "arguments": "",
-				},
-			})
-			seq++
-			_ = write(map[string]any{
-				"type": "response.function_call_arguments.delta", "item_id": itemID,
-				"output_index": outIdx, "delta": c.Function.Arguments, "sequence_number": seq,
-			})
-			seq++
-			_ = write(map[string]any{
-				"type": "response.function_call_arguments.done", "item_id": itemID,
-				"output_index": outIdx, "arguments": c.Function.Arguments, "sequence_number": seq,
+				"output_index": outIdx, "text": outText, "content_index": 0, "sequence_number": seq,
 			})
 			seq++
 			_ = write(map[string]any{
@@ -296,12 +415,6 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 			outIdx++
 			output = append(output, item)
 		}
-	} else {
-		output = responseOutputItems(outText, calls)
-		_ = write(map[string]any{
-			"type": "response.output_text.done",
-			"text": body,
-		})
 	}
 	_ = write(map[string]any{
 		"type": "response.completed",

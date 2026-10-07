@@ -140,14 +140,87 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 		},
 	})
 
-	// When tools are requested the reply is buffered so the raw tool-call
-	// JSON is parsed once and emitted as proper tool_use blocks instead of
-	// being streamed to the client as prose.
-	buffered := len(tools) > 0
-	if !buffered {
+	// With tools the raw tool-call JSON is converted into streamed tool_use
+	// blocks: content_block_start once id+name are known, then one
+	// input_json_delta per piece, instead of buffering the whole reply.
+	var args *openai.ArgStreamer
+	if len(tools) > 0 {
+		args = openai.NewArgStreamer()
+	}
+	if args == nil {
 		_ = writeEvent("content_block_start", map[string]any{
 			"type": "content_block_start", "index": 0,
 			"content_block": map[string]any{"type": "text", "text": ""},
+		})
+	}
+
+	// Anthropic content blocks are strictly sequential: close the open
+	// tool_use block before the next one starts. Deltas that arrive for an
+	// older block after a newer one opened are dropped — models emit calls
+	// in order.
+	var (
+		blockPos = 0  // next content block index
+		curIdx   = -1 // streamer index in focus
+		openPos  = -1 // content index of the open tool_use block, -1 = none
+		ids      = map[int]string{}
+		names    = map[int]string{}
+		pending  = map[int][]string{} // args held until the block can open
+	)
+	onToolDelta := func(d openai.ToolArgDelta) error {
+		if d.Index < curIdx {
+			return nil
+		}
+		if d.ID != "" {
+			ids[d.Index] = d.ID
+		}
+		if d.Name != "" {
+			names[d.Index] = d.Name
+		}
+		if d.Index > curIdx {
+			if openPos >= 0 {
+				if err := writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": openPos}); err != nil {
+					return err
+				}
+				openPos = -1
+				blockPos++
+			}
+			curIdx = d.Index
+		}
+		if openPos < 0 && names[d.Index] != "" {
+			id := ids[d.Index]
+			if id == "" {
+				id = anthropic.NewID("toolu_")
+			}
+			openPos = blockPos
+			if err := writeEvent("content_block_start", map[string]any{
+				"type": "content_block_start", "index": openPos,
+				"content_block": map[string]any{
+					"type": "tool_use", "id": id, "name": names[d.Index],
+					"input": json.RawMessage("{}"),
+				},
+			}); err != nil {
+				return err
+			}
+			for _, frag := range pending[d.Index] {
+				if err := writeEvent("content_block_delta", map[string]any{
+					"type": "content_block_delta", "index": openPos,
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": frag},
+				}); err != nil {
+					return err
+				}
+			}
+			delete(pending, d.Index)
+		}
+		if d.Args == "" {
+			return nil
+		}
+		if openPos < 0 {
+			pending[d.Index] = append(pending[d.Index], d.Args)
+			return nil
+		}
+		return writeEvent("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": openPos,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": d.Args},
 		})
 	}
 
@@ -162,13 +235,18 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 		}
 	}, func(seg string) error {
 		text.WriteString(seg)
-		if buffered {
-			return nil
+		if args == nil {
+			return writeEvent("content_block_delta", map[string]any{
+				"type": "content_block_delta", "index": 0,
+				"delta": map[string]any{"type": "text_delta", "text": seg},
+			})
 		}
-		return writeEvent("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": 0,
-			"delta": map[string]any{"type": "text_delta", "text": seg},
-		})
+		for _, d := range args.Feed(text.String()) {
+			if err := onToolDelta(d); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 
 	duration := time.Since(start)
@@ -201,40 +279,63 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 	usage := estimateUsage(prompt, body)
 	outText, calls := splitToolOutput(body, tools)
 
-	index := 0
-	if !buffered {
-		_ = writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
-		index = 1
-	} else if outText != "" {
-		_ = writeEvent("content_block_start", map[string]any{
-			"type": "content_block_start", "index": 0,
-			"content_block": map[string]any{"type": "text", "text": ""},
-		})
-		_ = writeEvent("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": 0,
-			"delta": map[string]any{"type": "text_delta", "text": outText},
-		})
-		_ = writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
-		index = 1
-	}
-	for _, c := range calls {
-		id := c.ID
-		if id == "" {
-			id = anthropic.NewID("toolu_")
+	if args != nil {
+		if len(calls) > 0 {
+			deltas, resend, diverged := args.Finalize(calls)
+			if diverged {
+				s.log.Warn("streamed tool arguments diverged from repaired parse", "model", req.Model, "detail", args.Diverge())
+			}
+			for _, d := range deltas {
+				_ = onToolDelta(d)
+			}
+			if openPos >= 0 {
+				_ = writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": openPos})
+				openPos = -1
+				blockPos++
+			}
+			for _, c := range resend {
+				id := c.ID
+				if id == "" {
+					id = anthropic.NewID("toolu_")
+				}
+				_ = writeEvent("content_block_start", map[string]any{
+					"type": "content_block_start", "index": blockPos,
+					"content_block": map[string]any{
+						"type": "tool_use", "id": id, "name": c.Function.Name,
+						"input": json.RawMessage("{}"),
+					},
+				})
+				_ = writeEvent("content_block_delta", map[string]any{
+					"type": "content_block_delta", "index": blockPos,
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Function.Arguments},
+				})
+				_ = writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": blockPos})
+				blockPos++
+			}
+		} else {
+			if args.Sent() {
+				s.log.Warn("tool parse failed after streaming argument deltas", "model", req.Model)
+			}
+			if openPos >= 0 {
+				_ = writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": openPos})
+				openPos = -1
+				blockPos++
+			}
 		}
-		_ = writeEvent("content_block_start", map[string]any{
-			"type": "content_block_start", "index": index,
-			"content_block": map[string]any{
-				"type": "tool_use", "id": id, "name": c.Function.Name,
-				"input": json.RawMessage("{}"),
-			},
-		})
-		_ = writeEvent("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": index,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Function.Arguments},
-		})
-		_ = writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
-		index++
+		if outText != "" {
+			_ = writeEvent("content_block_start", map[string]any{
+				"type": "content_block_start", "index": blockPos,
+				"content_block": map[string]any{"type": "text", "text": ""},
+			})
+			_ = writeEvent("content_block_delta", map[string]any{
+				"type": "content_block_delta", "index": blockPos,
+				"delta": map[string]any{"type": "text_delta", "text": outText},
+			})
+			_ = writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": blockPos})
+			blockPos++
+		}
+	} else {
+		_ = writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 	}
 	_ = writeEvent("message_delta", map[string]any{
 		"type":  "message_delta",

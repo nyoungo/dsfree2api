@@ -191,9 +191,12 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
 	var text strings.Builder
 	var firstDelta time.Time
 
-	// When tools are requested the whole reply is buffered so the raw
-	// tool-call JSON is never streamed to the client twice.
-	buffered := len(req.Tools) > 0
+	// With tools the raw tool-call JSON is converted into incremental
+	// tool_calls deltas instead of being buffered until the reply finishes.
+	var args *openai.ArgStreamer
+	if len(req.Tools) > 0 {
+		args = openai.NewArgStreamer()
+	}
 
 	write := func(v any) error {
 		raw, err := json.Marshal(v)
@@ -217,6 +220,16 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
 			Choices: []openai.StreamChoice{{Delta: delta, FinishReason: finish}},
 		}
 	}
+	writeToolDelta := func(d openai.ToolArgDelta) error {
+		tc := openai.ToolCallDelta{Index: d.Index}
+		if d.ID != "" {
+			tc.ID, tc.Type = d.ID, "function"
+		}
+		if d.Name != "" || d.Args != "" {
+			tc.Function = &openai.FunctionDelta{Name: d.Name, Arguments: d.Args}
+		}
+		return write(chunk(openai.ChoiceDelta{ToolCalls: []openai.ToolCallDelta{tc}}, nil))
+	}
 
 	_ = write(chunk(openai.ChoiceDelta{Role: "assistant"}, nil))
 
@@ -229,10 +242,15 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
 		}
 	}, func(seg string) error {
 		text.WriteString(seg)
-		if buffered {
-			return nil
+		if args == nil {
+			return write(chunk(openai.ChoiceDelta{Content: seg}, nil))
 		}
-		return write(chunk(openai.ChoiceDelta{Content: seg}, nil))
+		for _, d := range args.Feed(text.String()) {
+			if err := writeToolDelta(d); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 
 	duration := time.Since(start)
@@ -277,16 +295,33 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
 	}
 
 	usage := estimateUsage(prompt, body)
-	var toolCalls []openai.ToolCall
-	content := body
-	if buffered {
-		remaining, calls, ok := openai.TryParseToolCalls(body)
-		if ok {
-			content = remaining
-			toolCalls = calls
+	// content is only what was NOT streamed: prose around a tool JSON, or the
+	// whole reply when a tools request did not parse as a tool call at all.
+	// Plain text was already streamed per delta above.
+	content := ""
+	stop := "stop"
+	var resend []openai.ToolCall
+	if args == nil {
+		// plain reply: content streamed live, final chunk carries no content
+	} else if remaining, calls, ok := openai.TryParseToolCalls(body); ok {
+		content = remaining
+		stop = "tool_calls"
+		deltas, miss, diverged := args.Finalize(calls)
+		if diverged {
+			s.log.Warn("streamed tool arguments diverged from repaired parse", "model", req.Model, "detail", args.Diverge())
+		}
+		for _, d := range deltas {
+			_ = writeToolDelta(d)
+		}
+		resend = miss
+	} else {
+		// tools were requested but the reply is not a tool call: it was never
+		// streamed, so deliver it as content in the final chunk.
+		content = body
+		if args.Sent() {
+			s.log.Warn("tool parse failed after streaming argument deltas", "model", req.Model)
 		}
 	}
-	stop := finishReason(toolCalls)
 
 	// Final chunk: content + tool_calls (or plain stop marker).
 	final := map[string]any{
@@ -304,8 +339,8 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
 	if content != "" {
 		deltaPayload["content"] = content
 	}
-	if len(toolCalls) > 0 {
-		deltaPayload["tool_calls"] = toolCalls
+	if len(resend) > 0 {
+		deltaPayload["tool_calls"] = resend
 	}
 	if len(deltaPayload) > 0 {
 		final["choices"] = []map[string]any{{
