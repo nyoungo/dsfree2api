@@ -1,0 +1,6 @@
+# Normalize text files to LF in the repository and working tree,
+# regardless of each contributor's core.autocrlf setting.
+* text=auto eol=lf
+
+*.png binary
+*.exe binary

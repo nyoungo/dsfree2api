@@ -2,6 +2,8 @@ bin/
 data/
 *.log
 *.exe
+*.sha256
+dsfree2api-linux-*
 config.toml
 config.toml.bak
 .freebuff/

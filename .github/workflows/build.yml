@@ -1,0 +1,63 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            artifact: linux-amd64
+          - goos: windows
+            goarch: amd64
+            artifact: windows-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build ${{ matrix.artifact }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          version="$(awk '/^VERSION/{print $3; exit}' Makefile)"
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          out="dsfree2api-${{ matrix.artifact }}${ext}"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/nyoungo/dsfree2api/internal/admin.Version=${version}" \
+            -o "$out" ./cmd/dsfree2api
+          sha256sum "$out" > "${out}.sha256"
+          echo "built: $out  version: $version  size: $(du -h "$out" | cut -f1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsfree2api-${{ matrix.artifact }}
+          path: dsfree2api-${{ matrix.artifact }}*
+          if-no-files-found: error
