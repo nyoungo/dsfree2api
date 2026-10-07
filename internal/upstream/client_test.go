@@ -268,3 +268,71 @@ func TestSSEDeltaAndDoneEvents(t *testing.T) {
 		t.Fatalf("done event = %+v err=%v", evs, err)
 	}
 }
+
+func TestQuotaSiteCoolsDownAndPrefersSibling(t *testing.T) {
+	cfg := testConfig(t)
+	c := New(cfg, nil, nil)
+	calls := map[string]int{}
+	c.chatOnceOverride = func(_ context.Context, site config.Site, modelID string, model config.Model,
+		_ string, _ Route, _ *ServeInfo, _ func(Event) error) error {
+		calls[site.Code]++
+		if site.Code == "de" {
+			return newQuota("sse quota exhausted: test")
+		}
+		return nil
+	}
+	emit := func(Event) error { return nil }
+
+	// Round 1: primary reports quota, a sibling serves the request.
+	if err := c.Chat(context.Background(), "deepseek-v4-flash-de", "p", nil, emit); err != nil {
+		t.Fatalf("first Chat: %v", err)
+	}
+	if calls["de"] != 1 {
+		t.Fatalf("de calls = %d, want 1", calls["de"])
+	}
+	if calls["es"]+calls["fr"] == 0 {
+		t.Fatal("sibling site was not attempted after primary quota error")
+	}
+
+	// Round 2: de sits on cooldown and must be skipped entirely.
+	delete(calls, "de")
+	delete(calls, "es")
+	delete(calls, "fr")
+	if err := c.Chat(context.Background(), "deepseek-v4-flash-de", "p", nil, emit); err != nil {
+		t.Fatalf("second Chat: %v", err)
+	}
+	if calls["de"] != 0 {
+		t.Fatalf("cooled site hit again: %d calls", calls["de"])
+	}
+	if calls["es"]+calls["fr"] == 0 {
+		t.Fatal("sibling site not used on second round")
+	}
+	if !c.quotaCooled("de") {
+		t.Fatal("de should still be cooling down")
+	}
+}
+
+func TestCacheEmptyFailsOverToMirrorWithoutRefreshCycles(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Upstream.AutoRefresh = true
+	cfg.Upstream.RefreshRetries = 3
+	c := New(cfg, nil, nil)
+	calls := map[string]int{}
+	c.chatOnceOverride = func(_ context.Context, site config.Site, modelID string, model config.Model,
+		_ string, _ Route, _ *ServeInfo, _ func(Event) error) error {
+		calls[site.Code]++
+		if site.Code == "de" {
+			return errf(`cache message http 400: {"success":false,"data":{"code":"empty_data_to_cache"}}`)
+		}
+		return nil
+	}
+	if err := c.Chat(context.Background(), "deepseek-v4-flash-de", "p", nil, func(Event) error { return nil }); err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if calls["de"] != 1 {
+		t.Fatalf("de calls = %d, want 1 (cache rejection must fail fast, not burn refresh cycles)", calls["de"])
+	}
+	if calls["es"]+calls["fr"] == 0 {
+		t.Fatal("mirror was not attempted after cache rejection")
+	}
+}

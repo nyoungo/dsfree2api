@@ -132,6 +132,14 @@ func isConfigProblem(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "nonce fetch failed")
 }
 
+// isCacheEmptyProblem matches the site's cache-message rejection that a
+// dropped config or a cookie re-solve never fixes on the same site: the
+// mirrors carry independent sessions, so callers fail over instead of
+// burning refresh cycles.
+func isCacheEmptyProblem(err error) bool {
+	return strings.Contains(err.Error(), "empty_data_to_cache")
+}
+
 // isQuotaPayload mirrors the German/English quota notices used upstream.
 func isQuotaPayload(payload map[string]any) bool {
 	if _, ok := payload["quota_notice"]; ok {

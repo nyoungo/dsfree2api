@@ -1,14 +1,17 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +51,14 @@ type Client struct {
 	cfgLocks map[string]*sync.Mutex
 	gates    map[string]chan struct{}
 
+	// quotaCool marks sites that recently answered with quota errors; they
+	// are tried after the healthy mirrors until the cooldown expires.
+	quotaCool map[string]time.Time
+	// lastWarn* dedupes repeated identical upstream errors so a quota
+	// storm cannot drown the log.
+	lastWarnMsg string
+	lastWarnAt  time.Time
+
 	// chatOnceOverride is a test seam; nil in production.
 	chatOnceOverride func(ctx context.Context, site config.Site, modelID string, model config.Model,
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error
@@ -58,12 +69,13 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger) *Client {
 		log = slog.Default()
 	}
 	return &Client{
-		cfg:      cfg,
-		ts:       ts,
-		log:      log,
-		chatCfg:  map[string]chatConfig{},
-		cfgLocks: map[string]*sync.Mutex{},
-		gates:    map[string]chan struct{}{},
+		cfg:       cfg,
+		ts:        ts,
+		log:       log,
+		chatCfg:   map[string]chatConfig{},
+		cfgLocks:  map[string]*sync.Mutex{},
+		gates:     map[string]chan struct{}{},
+		quotaCool: map[string]time.Time{},
 	}
 }
 
@@ -98,6 +110,98 @@ func (c *Client) Routes() []Route {
 	return out
 }
 
+// quotaCoolTTL is how long a site that answered with quota errors keeps
+// being tried after its healthy mirrors.
+const quotaCoolTTL = 10 * time.Minute
+
+// quotaCooled reports whether a site is inside its quota cooldown window.
+func (c *Client) quotaCooled(code string) bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	until, ok := c.quotaCool[code]
+	return ok && time.Now().Before(until)
+}
+
+// setQuotaCool cools a site down after it reported quota exhaustion.
+// Repeat detections inside the window only extend it; the INFO line marks
+// the transition, not every probe that confirms it.
+func (c *Client) setQuotaCool(code string) {
+	c.stateMu.Lock()
+	until, ok := c.quotaCool[code]
+	now := time.Now()
+	if ok && now.Add(quotaCoolTTL).Before(until) {
+		c.stateMu.Unlock()
+		return
+	}
+	c.quotaCool[code] = now.Add(quotaCoolTTL)
+	c.stateMu.Unlock()
+	c.log.Info("site quota cooldown", "site", code, "for", quotaCoolTTL)
+}
+
+// sortQuotaCoolLast moves quota-cooled sites behind the healthy candidates,
+// preserving relative order inside both groups.
+func (c *Client) sortQuotaCoolLast(ids []string) []string {
+	var cooled, rest []string
+	for _, id := range ids {
+		m, ok := c.modelCopy(id)
+		if ok && c.quotaCooled(m.Site) {
+			cooled = append(cooled, id)
+			continue
+		}
+		rest = append(rest, id)
+	}
+	if len(cooled) == 0 {
+		return ids
+	}
+	return append(rest, cooled...)
+}
+
+// logUpstreamErr records one failed upstream attempt. Quota errors cool the
+// site down and repeats of an identical error inside a short window drop to
+// DEBUG, so a balance-starved site neither taxes every continuation round
+// nor floods the log.
+func (c *Client) logUpstreamErr(site, modelID string, attempt int, route Route, err error) {
+	if isQuota(err) {
+		c.setQuotaCool(site)
+	}
+	msg := err.Error()
+	c.stateMu.Lock()
+	dup := msg == c.lastWarnMsg && time.Since(c.lastWarnAt) < 30*time.Second
+	c.lastWarnMsg = msg
+	c.lastWarnAt = time.Now()
+	c.stateMu.Unlock()
+	if dup {
+		c.log.Debug("upstream error (repeating)", "model", modelID, "attempt", attempt+1, "route", route.Name, "error", err)
+		return
+	}
+	c.log.Warn("upstream error", "model", modelID, "attempt", attempt+1, "route", route.Name, "error", err)
+}
+
+// logCacheReject fingerprints a prompt the site's cache step called empty:
+// byte class counts plus head/tail quotes tell whether the rejection tracks
+// prompt content (WAF/filter) or session state.
+func (c *Client) logCacheReject(site, modelID, prompt string) {
+	nul, ctrl := 0, 0
+	for i := 0; i < len(prompt); i++ {
+		b := prompt[i]
+		switch {
+		case b == 0:
+			nul++
+		case b < 0x20 && b != '\n' && b != '\r' && b != '\t':
+			ctrl++
+		}
+	}
+	head, tail := prompt, ""
+	if r := []rune(prompt); len(r) > 160 {
+		head, tail = string(r[:80]), string(r[len(r)-80:])
+	}
+	sum := sha256.Sum256([]byte(prompt))
+	c.log.Warn("cache message rejected",
+		"site", site, "model", modelID, "chars", len(prompt),
+		"nul", nul, "ctrl", ctrl, "sha", hex.EncodeToString(sum[:8]),
+		"head", strconv.Quote(head), "tail", strconv.Quote(tail))
+}
+
 // Chat streams the prompt through the upstream site, honouring route
 // failover, slow-start detection, session refresh and cross-site failover.
 func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *ServeInfo, yield func(Event) error) error {
@@ -115,26 +219,47 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
 			candidates = append(candidates, alt)
 		}
 	}
+	// A site that recently reported quota errors keeps being tried, but
+	// behind the healthy mirrors — continuation rounds stop paying its
+	// refresh tax while its balance is empty.
+	candidates = c.sortQuotaCoolLast(candidates)
 
 	var last error
-	for i, id := range candidates {
+	triedPrimary := false
+	prev := ""
+	for _, id := range candidates {
 		m := model
-		if i > 0 {
+		if id == modelID {
+			triedPrimary = true
+		} else {
 			mc, ok := c.modelCopy(id)
 			if !ok || !mc.Enabled {
 				continue
 			}
 			m = mc
-			c.log.Warn("cross-site failover", "from", modelID, "to", id)
+		}
+		// Only a real switch after a failed candidate is a failover; the
+		// first pick of a request (even a sorted-past primary) is not.
+		if prev != "" && prev != id {
+			c.log.Warn("cross-site failover", "from", prev, "to", id)
 		}
 		err := c.chatWithRetries(ctx, id, m, prompt, info, yield)
 		if err == nil {
 			return nil
 		}
 		last = err
-		if contentStarted(err) || !isQuota(err) {
+		if contentStarted(err) || !turnstile.Retryable(err) {
 			return AsUpstream(err)
 		}
+		// Quota means this site has no balance and a cache-rejection means
+		// its session is off: the next candidate is the point. Other errors
+		// keep going only while the primary has not had its chance yet (a
+		// quota-cooled primary sits at the end of the list); once it failed
+		// too, report that error as before.
+		if !isQuota(err) && !isCacheEmptyProblem(err) && triedPrimary {
+			return AsUpstream(err)
+		}
+		prev = id
 	}
 	return AsUpstream(last)
 }
@@ -225,9 +350,14 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 			if isConfigProblem(err) {
 				return AsUpstream(err)
 			}
+			// The cache step rejected the message in a way config drops and
+			// cookie refreshes do not fix; stop burning refresh cycles so
+			// the caller can fail over to a mirror right away.
+			if isCacheEmptyProblem(err) {
+				return AsUpstream(err)
+			}
 			failed = append(failed, route)
-			c.log.Warn("upstream error",
-				"model", modelID, "attempt", attempt+1, "route", route.Name, "error", err)
+			c.logUpstreamErr(site.Code, modelID, attempt, route, err)
 			if i < len(routes)-1 {
 				continue
 			}
@@ -249,7 +379,11 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 				return AsUpstream(ctx.Err())
 			case <-time.After(wait):
 			}
-			forceCookie := isQuota(lastErr) || isSession(lastErr)
+			// Session errors need a fresh cookie right away. Quota errors
+			// often clear once the cached chat config is dropped, so the
+			// first cycle retries cheaply and only the second one pays for
+			// a Turnstile re-solve.
+			forceCookie := isSession(lastErr) || (isQuota(lastErr) && attempt >= 1)
 			for _, route := range failed {
 				if err := c.refreshSession(ctx, site, modelID, route, forceCookie); err != nil {
 					c.log.Warn("session refresh failed", "model", modelID, "error", err)
@@ -419,6 +553,9 @@ func (c *Client) chatOnce(
 	})
 	if err != nil {
 		return errf("cache message request failed: %v", err)
+	}
+	if bytes.Contains(resp.Body, []byte("empty_data_to_cache")) {
+		c.logCacheReject(site.Code, modelID, prompt)
 	}
 	if resp.Status >= 400 {
 		if resp.Status == 403 || resp.Status == 401 {
