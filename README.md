@@ -33,6 +33,7 @@ Go 实现，编译为**单个静态二进制**，无运行时依赖；内置 **W
 - **多格式对话接口**：`POST /v1/chat/completions`（OpenAI，流式 / 非流式）、`POST /v1/responses`（OpenAI Responses）、`POST /v1/messages`（Anthropic Messages）、`GET /v1/models`、`GET /health`
 - **Tool Calling**：三个对话端点均支持 `tools` / `tool_choice`，模型以 JSON 输出 tool_calls，自动回填到响应（`tool_calls` / `function_call` / `tool_use`）；回复被上游输出上限截断时自动多轮续写拼接（`continue_rounds`），仍不闭合则在截断处就近补全为部分工具调用返回，由客户端下一轮继续写
 - **三站点聚合**：单站点每日额度耗尽自动切换到其他站点的同款模型，额度耗尽的站点临时降级 10 分钟
+- **站点额度管理**：额度按访客身份按日计算，控制台站点卡片可一键查询当前额度、重置访客身份（等同新开隐私窗口、额度即刻回满）；请求撞额度时也会自动轮换访客身份恢复，无需重新求解
 - **代理线路**：主线路 + 多条备用线路，支持 `http://` `https://` `socks5://`；slow-start 检测 + 失败降级 + 流中失败不重放
 - **Turnstile 自动突破**：三种 Token 获取方式 — 求解服务 API（`provider="api"`）、本地浏览器自动求解（`provider="browser"`，CDP 直连 Chrome/Edge，无需 Playwright/Docker）、手动导入 Cookie（`provider="manual"`）；结果按「代理线路 × 站点」缓存，TTL 过期自动重解
 - **会话自愈**：nonce / data-config 缓存 + 配额耗尽 / 验证失败时自动刷新重试

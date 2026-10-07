@@ -178,7 +178,9 @@ PAGES.dashboard = async () => {
         <div class="toolbar">
           <div><b>${esc(s.code.toUpperCase())}</b> <span class="pill ${s.enabled ? "on" : "off"}">${s.enabled ? "启用" : "停用"}</span>
             <div class="dim">${esc(s.base_url)}</div></div>
-          <div class="right"><button class="btn small" data-probe="${esc(s.code)}">探测</button></div>
+          <div class="right"><button class="btn small" data-probe="${esc(s.code)}">探测</button>
+            <button class="btn small" data-quota="${esc(s.code)}">额度</button>
+            <button class="btn small" data-rotate="${esc(s.code)}">重置</button></div>
         </div>
         <div class="dim" style="margin-top:8px">请求 ${fmtInt(ms ? ms.requests : 0)} · 错误 ${fmtInt(ms ? ms.errors : 0)} · Cookie ${ts.valid ? "有效 " + Math.round(ts.remaining_s / 60) + " 分钟" : "未建立"}</div>
         <div class="bar"><i style="width:${pct}%"></i></div></div>`;
@@ -191,6 +193,25 @@ PAGES.dashboard = async () => {
         toast(r.ok ? `${b.dataset.probe}: HTTP ${r.status} · ${r.ms}ms · 对话容器 ${r.chat_container ? "有" : "无"}` : `${b.dataset.probe}: ${r.error || "失败"}`, r.ok ? "ok" : "err");
       } catch (e) { toast(e.message, "err"); }
       b.disabled = false; b.textContent = "探测";
+    });
+
+    $$("[data-quota]").forEach(b => b.onclick = async () => {
+      b.disabled = true; b.textContent = "…";
+      try {
+        const r = await api("/api/actions", { body: { action: "site_balance", site: b.dataset.quota } });
+        const period = r.reset_period === "daily" ? "每日" : (r.reset_period || "");
+        toast(r.ok ? `${b.dataset.quota}: 剩余 ${fmtInt(r.remaining)} / ${fmtInt(r.limit)} · 已用 ${fmtInt(r.used)} · ${period}重置` : `${b.dataset.quota}: ${r.error || "失败"}`, r.ok ? "ok" : "err");
+      } catch (e) { toast(e.message, "err"); }
+      b.disabled = false; b.textContent = "额度";
+    });
+
+    $$("[data-rotate]").forEach(b => b.onclick = async () => {
+      b.disabled = true; b.textContent = "…";
+      try {
+        const r = await api("/api/actions", { body: { action: "rotate_guest", site: b.dataset.rotate } });
+        toast(r.ok ? `${b.dataset.rotate}: 已换新访客身份，剩余 ${fmtInt(r.remaining)} / ${fmtInt(r.limit)}` : `${b.dataset.rotate}: ${r.error || "失败"}`, r.ok ? "ok" : "err");
+      } catch (e) { toast(e.message, "err"); }
+      b.disabled = false; b.textContent = "重置";
     });
 
     const rec = (m.recent || []).slice(0, 30);

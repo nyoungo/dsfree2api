@@ -382,6 +382,20 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(body, &p)
 		writeJSON(w, http.StatusOK, s.probeSite(p.Site))
 
+	case "site_balance":
+		var p struct {
+			Site string `json:"site"`
+		}
+		_ = json.Unmarshal(body, &p)
+		writeJSON(w, http.StatusOK, s.siteBalance(p.Site))
+
+	case "rotate_guest":
+		var p struct {
+			Site string `json:"site"`
+		}
+		_ = json.Unmarshal(body, &p)
+		writeJSON(w, http.StatusOK, s.rotateGuest(p.Site))
+
 	default:
 		fail(w, "unknown action: "+req.Action)
 	}
@@ -574,6 +588,71 @@ func firstNonEmpty(vals ...string) string {
 
 // siteCodes resolves a requested site code to a list; an empty request means
 // every configured site.
+// siteBalance reports the free daily tier of the visitor id currently
+// cached for the site (same endpoint the site's own balance badge uses).
+func (s *Server) siteBalance(code string) map[string]any {
+	site, ok, proxy, botID := s.balanceContext(code)
+	if !ok {
+		return map[string]any{"ok": false, "error": "site not found"}
+	}
+	gid, has := s.ts.GuestID(code, proxy)
+	if !has {
+		return map[string]any{"ok": false, "error": "no cached session for this site — send a chat request first"}
+	}
+	return s.balanceJSON(code, site, gid, botID, proxy, false)
+}
+
+// rotateGuest swaps the site's visitor cookie for a fresh id — the site
+// hands every new visitor id its own daily free tier, the same effect as a
+// new private window — then reports the new identity's balance.
+func (s *Server) rotateGuest(code string) map[string]any {
+	site, ok, proxy, botID := s.balanceContext(code)
+	if !ok {
+		return map[string]any{"ok": false, "error": "site not found"}
+	}
+	gid := s.ts.RotateGuest(code)
+	if gid == "" {
+		return map[string]any{"ok": false, "error": "no cached session for this site — refresh cookies first"}
+	}
+	return s.balanceJSON(code, site, gid, botID, proxy, true)
+}
+
+func (s *Server) balanceContext(code string) (config.Site, bool, string, int) {
+	s.cfg.RLock()
+	defer s.cfg.RUnlock()
+	st, ok := s.cfg.Sites[code]
+	if !ok {
+		return config.Site{}, false, "", 0
+	}
+	botID := 0
+	for _, m := range s.cfg.Models {
+		if m.Site == code && m.Enabled {
+			botID = m.BotID
+			break
+		}
+	}
+	return *st, true, s.cfg.Proxy.URL, botID
+}
+
+func (s *Server) balanceJSON(code string, site config.Site, gid string, botID int, proxy string, rotated bool) map[string]any {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	bal, err := s.up.FetchBalance(ctx, site, gid, botID, upstream.Route{Name: "balance", Proxy: proxy})
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	out := map[string]any{
+		"ok": true, "site": code, "rotated": rotated,
+		"balance": bal.Balance, "limit": bal.Free.Limit,
+		"used": bal.Free.Used, "remaining": bal.Free.Remaining,
+		"reset_period": bal.Free.ResetPeriod,
+	}
+	if rotated {
+		s.log.Info("visitor identity rotated from console", "site", code, "remaining", bal.Free.Remaining)
+	}
+	return out
+}
+
 func (s *Server) siteCodes(want string) []string {
 	s.cfg.RLock()
 	defer s.cfg.RUnlock()
