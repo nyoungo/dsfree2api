@@ -31,8 +31,8 @@ Go 实现，编译为**单个静态二进制**，无运行时依赖；内置 **W
 ## 功能特性
 
 - **多格式对话接口**：`POST /v1/chat/completions`（OpenAI，流式 / 非流式）、`POST /v1/responses`（OpenAI Responses）、`POST /v1/messages`（Anthropic Messages）、`GET /v1/models`、`GET /health`
-- **Tool Calling**：三个对话端点均支持 `tools` / `tool_choice`，模型以 JSON 输出 tool_calls，自动回填到响应（`tool_calls` / `function_call` / `tool_use`）；回复被上游输出上限截断时自动多轮续写拼接（`continue_rounds`）
-- **三站点聚合**：单站点配额耗尽自动切换到其他站点的同款模型
+- **Tool Calling**：三个对话端点均支持 `tools` / `tool_choice`，模型以 JSON 输出 tool_calls，自动回填到响应（`tool_calls` / `function_call` / `tool_use`）；回复被上游输出上限截断时自动多轮续写拼接（`continue_rounds`），仍不闭合则在截断处就近补全为部分工具调用返回，由客户端下一轮继续写
+- **三站点聚合**：单站点每日额度耗尽自动切换到其他站点的同款模型，额度耗尽的站点临时降级 10 分钟
 - **代理线路**：主线路 + 多条备用线路，支持 `http://` `https://` `socks5://`；slow-start 检测 + 失败降级 + 流中失败不重放
 - **Turnstile 自动突破**：三种 Token 获取方式 — 求解服务 API（`provider="api"`）、本地浏览器自动求解（`provider="browser"`，CDP 直连 Chrome/Edge，无需 Playwright/Docker）、手动导入 Cookie（`provider="manual"`）；结果按「代理线路 × 站点」缓存，TTL 过期自动重解
 - **会话自愈**：nonce / data-config 缓存 + 配额耗尽 / 验证失败时自动刷新重试
@@ -138,7 +138,7 @@ dsfree2api -config config.toml -check
 | `[admin]` | 管理台 `enabled` / `host` / `port` / `password`（留空启动时生成随机密码） |
 | `[limits]` | `max_concurrent_per_site` 每站点并发、`rate_per_minute` 每 Key 每分钟限流（0 = 不限） |
 | `[proxy]` | `url` 主线路、`fallback_urls` 备用线路、`slow_start_seconds` 首事件超时 |
-| `[upstream]` | 超时、配置缓存 TTL、会话自动刷新、`cross_site_failover` 跨站切换、`continue_rounds` 工具调用截断续写轮数 |
+| `[upstream]` | 超时、配置缓存 TTL、会话自动刷新、`cross_site_failover` 跨站切换、`continue_rounds` 工具调用截断续写轮数（0 = 不续写、直接截断补全） |
 | `[turnstile]` | **默认 `enabled = false` 且不内置任何求解服务**；`provider` 三选一：`api`（填 `api_url` / `api_key`）、`browser`（填 `browser_path` 指向本机 Chrome/Edge）、`manual`（只用控制台导入的 Cookie），另有 Cookie TTL、重试次数 |
 | `[sites.*]` | 三个站点的 `base_url` / `ajax_url` / `sitekey` / `language` |
 | `[models.*]` | 模型到 `site` + `upstream_id` + `bot_id` / `post_id` 的映射 |
