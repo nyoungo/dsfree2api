@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log/slog"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -673,6 +675,13 @@ func (c *Client) chatOnce(
 	}
 	defer rc.Close()
 
+	if os.Getenv("DSFREE_SSE_TIMING") != "" {
+		start := time.Now()
+		rc = &sseTimingReader{rc: rc, start: start, logf: func(n int) {
+			c.log.Info("sse read", "at_ms", time.Since(start).Milliseconds(), "n", n)
+		}}
+	}
+
 	return readSSE(rc, func(event string, lines []string) error {
 		events, err := translateEvent(event, lines)
 		if err != nil {
@@ -686,6 +695,24 @@ func (c *Client) chatOnce(
 		return nil
 	})
 }
+
+// sseTimingReader (diagnosis only, gated by DSFREE_SSE_TIMING) logs when bytes
+// arrive from the upstream stream.
+type sseTimingReader struct {
+	rc    io.ReadCloser
+	start time.Time
+	logf  func(n int)
+}
+
+func (r *sseTimingReader) Read(p []byte) (int, error) {
+	n, err := r.rc.Read(p)
+	if n > 0 {
+		r.logf(n)
+	}
+	return n, err
+}
+
+func (r *sseTimingReader) Close() error { return r.rc.Close() }
 
 // chatConfig fetches (and caches) the page-embedded nonce for a model.
 func (c *Client) chatConfig(
