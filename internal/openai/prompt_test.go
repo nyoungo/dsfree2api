@@ -36,6 +36,24 @@ func TestBuildPromptWithTools(t *testing.T) {
 	}
 }
 
+// 红测试：上游模型曾用 DeepSeek 原生 DSML 标记（<|DSML|> calls> / invoke /
+// parameter）代替 JSON 输出工具调用，网关三层（流式、解析、续写）都只认
+// JSON，整段标记被当普通文本发给客户端。指令层必须显式禁止该方言。
+func TestToolsPromptForbidsDSML(t *testing.T) {
+	prompt := BuildPrompt([]ChatMessage{
+		{Role: "user", Content: MessageContent{Text: "Hi"}},
+	}, PromptOptions{Tools: []ToolDef{{
+		Type:     "function",
+		Function: Function{Name: "write", Description: "Write a file"},
+	}}})
+	if !strings.Contains(prompt, "DSML") {
+		t.Error("tool instructions must explicitly forbid DSML markup")
+	}
+	if !strings.Contains(prompt, "Never") {
+		t.Error("tool instructions must state the DSML ban as a prohibition")
+	}
+}
+
 func TestBuildPromptAppendsSamplingConstraints(t *testing.T) {
 	temp := 0.4
 	max := 512

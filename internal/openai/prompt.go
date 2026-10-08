@@ -237,6 +237,13 @@ func toolsPrompt(tools []ToolDef, toolChoice json.RawMessage) string {
 		"",
 		`{"tool_calls": [{"id": "call_xxx", "type": "function", "function": {"name": "tool_name", "arguments": "{\"param\": \"value\"}"}}]}`,
 		"",
+		// DeepSeek 模型有时会退回自己的 DSML 标记方言（<|DSML|> calls> /
+		// invoke / parameter），网关不解析该方言，整段会被当普通文本透传，
+		// 客户端收不到 tool_calls——指令层显式禁止，只认上面的 JSON。
+		"Never call tools with DSML/XML-style markup (for example `<|DSML|> calls>` or " +
+			"`<|DSML|> invoke name=\"...\">`). Those tags are discarded — only the " +
+			"JSON format above is accepted.",
+		"",
 		"Available tools:",
 	}
 	for i, tool := range tools {
