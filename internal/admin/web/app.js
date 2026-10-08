@@ -13,6 +13,7 @@ const TITLES = {
 let overviewTimer = null;
 let logStop = null;
 let lastOverview = null;
+let pxMode = "basic"; // 代理线路页签：basic=基础线路 pool=代理池，重渲染后保留
 
 /* ── helpers ─────────────────────────────────────────────── */
 function toast(msg, kind) {
@@ -56,7 +57,9 @@ const fmtBytes = n => n > 1048576 ? (n / 1048576).toFixed(1) + "MB" : n > 1024 ?
 const timeStr = t => new Date(t).toLocaleTimeString("zh-CN", { hour12: false });
 
 function switchHTML(id, checked) {
-  return `<label class="switch"><input type="checkbox" id="${id}" ${checked ? "checked" : ""}><span class="slider"></span></label>`;
+  // id 可能含模型名/站点码等配置里的任意字符，必须转义，否则闭合属性后
+  // 会把后面的 checked/span 拆成攻击者可控的标记。
+  return `<label class="switch"><input type="checkbox" id="${esc(id)}" ${checked ? "checked" : ""}><span class="slider"></span></label>`;
 }
 
 /* ── auth ────────────────────────────────────────────────── */
@@ -330,75 +333,92 @@ PAGES.proxy = async () => {
   const p = ov.proxy;
   const pool = ov.proxypool || { xray: {}, entries: [], subscriptions: [], sticky: {} };
   view.innerHTML = `
-    <div class="grid g2">
-      <div class="card"><h3>主线路</h3>
-        <div class="field"><label>PROXY_URL（留空 = 直连）</label><input id="px-primary" value="${esc(p.url)}" placeholder="socks5://user:pass@host:port"></div>
-        <div class="row">
-          <button class="btn primary" id="px-save">保存</button>
-          <button class="btn" id="px-test">连通性测试</button>
-        </div>
-        <div class="dim mt">支持 http:// · https:// · socks5://</div>
-      </div>
-      <div class="card"><h3>降级策略</h3>
-        <div class="row">
-          <div class="field"><label>slow-start（秒）</label><input id="px-slow" type="number" step="0.5" value="${p.slow_start}"></div>
-          <div class="field"><label>每站点并发</label><input id="px-conc" type="number" value="${p.max_concurrent}"></div>
-          <div class="field"><label>每 Key 请求/分钟（0=不限）</label><input id="px-rate" type="number" value="${p.rate_per_minute}"></div>
-        </div>
-        <div class="row mt">
-          <div class="field"><label>跨站配额切换</label>${switchHTML("px-cross", p.cross_site_failover)}</div>
-          <button class="btn primary right" id="px-savelim">保存</button>
-        </div>
-        <div class="dim mt">主线路在 slow-start 内无首事件，或输出内容前失败时，自动切换到备用线路。</div>
+    <div class="card"><div class="toolbar">
+      <h3 style="margin:0">出站线路</h3>
+      <div class="seg" id="px-seg" style="flex:1;max-width:420px">
+        <button type="button" data-m="basic">基础线路</button>
+        <button type="button" data-m="pool">代理池</button>
       </div>
     </div>
-    <div class="card"><div class="toolbar"><h3 style="margin:0">备用线路</h3>
-      <div class="row"><input id="px-fb" placeholder="socks5://..." style="width:280px"><button class="btn" id="px-add">添加</button></div></div>
-      <div class="table-wrap mt"><table><thead><tr><th>#</th><th>地址</th><th></th></tr></thead><tbody id="tb-fb"></tbody></table></div>
-      <div class="dim mt">当前生效顺序：${ov.cache.routes.map(r => `<span class="tag">${esc(r.name)} → ${esc(r.proxy)}</span>`).join(" ")}</div>
+    <div class="dim" id="px-hint" style="margin-top:10px"></div></div>
+
+    <div class="px-mode" data-mode="basic">
+      <div class="grid g2 mt">
+        <div class="card"><h3>主线路</h3>
+          <div class="field"><label>PROXY_URL（留空 = 直连）</label><input id="px-primary" value="${esc(p.url)}" placeholder="socks5://user:pass@host:port"></div>
+          <div class="row">
+            <button class="btn primary" id="px-save">保存</button>
+            <button class="btn" id="px-test">连通性测试</button>
+          </div>
+          <div class="dim mt">支持 http:// · https:// · socks5://</div>
+        </div>
+        <div class="card"><h3>限流与故障切换</h3>
+          <div class="row">
+            <div class="field"><label>slow-start（秒）</label><input id="px-slow" type="number" step="0.5" value="${p.slow_start}"></div>
+            <div class="field"><label>每站点并发</label><input id="px-conc" type="number" value="${p.max_concurrent}"></div>
+            <div class="field"><label>每 Key 请求/分钟（0=不限）</label><input id="px-rate" type="number" value="${p.rate_per_minute}"></div>
+          </div>
+          <div class="row mt">
+            <div class="field"><label>跨站配额切换</label>${switchHTML("px-cross", p.cross_site_failover)}</div>
+            <button class="btn primary right" id="px-savelim">保存</button>
+          </div>
+          <div class="dim mt">主线路在 slow-start 内无首事件，或输出内容前失败时，自动切换到备用线路。</div>
+        </div>
+      </div>
+      <div class="card mt"><div class="toolbar"><h3 style="margin:0">备用线路</h3>
+        <div class="row"><input id="px-fb" placeholder="socks5://..." style="width:280px"><button class="btn" id="px-add">添加</button></div></div>
+        <div class="table-wrap mt"><table><thead><tr><th>#</th><th>地址</th><th></th></tr></thead><tbody id="tb-fb"></tbody></table></div>
+        <div class="dim mt">当前生效顺序：${ov.cache.routes.map(r => `<span class="tag">${esc(r.name)} → ${esc(r.proxy)}</span>`).join(" ")}</div>
+      </div>
     </div>
-    <div class="grid g2 mt">
-      <div class="card"><h3>代理池 · Xray 核心</h3>
-        <div class="row">
-          <div class="field"><label>池开关</label>${switchHTML("pool-en", pool.enabled)}</div>
-          <div class="field"><label>检查间隔（秒）</label><input id="pool-check-int" type="number" min="10" value="${pool.check_interval_seconds || 120}"></div>
-          <div class="field"><label>检查超时（秒）</label><input id="pool-check-to" type="number" min="2" value="${pool.check_timeout_seconds || 10}"></div>
+
+    <div class="px-mode" data-mode="pool" style="display:none">
+      <div class="grid g2 mt">
+        <div class="card"><h3>代理池 · 基础</h3>
+          <div class="row">
+            <div class="field"><label>池开关</label>${switchHTML("pool-en", pool.enabled)}</div>
+            <div class="field"><label>检查间隔（秒）</label><input id="pool-check-int" type="number" min="10" value="${pool.check_interval_seconds || 120}"></div>
+            <div class="field"><label>检查超时（秒）</label><input id="pool-check-to" type="number" min="2" value="${pool.check_timeout_seconds || 10}"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>健康检查 URL</label><input id="pool-check-url" value="${esc(pool.check_url || "")}" placeholder="https://www.gstatic.com/generate_204"></div>
+            <div class="field"><label>裸 ip:port 默认协议</label><input id="pool-scheme" value="${esc(pool.default_scheme || "http")}" placeholder="http / socks5"></div>
+          </div>
+          <div class="row mt">
+            <button class="btn primary" data-pool-save>保存池配置</button>
+            <button class="btn" id="pool-refresh">刷新节点与健康检查</button>
+          </div>
+          <div class="dim mt">${pool.last_error ? `<span style="color:var(--err)">${esc(pool.last_error)}</span>` : "节点健康与订阅拉取在后台按间隔巡检。"}</div>
         </div>
-        <div class="row">
-          <div class="field"><label>健康检查 URL</label><input id="pool-check-url" value="${esc(pool.check_url || "")}" placeholder="https://www.gstatic.com/generate_204"></div>
-          <div class="field"><label>裸 ip:port 默认协议</label><input id="pool-scheme" value="${esc(pool.default_scheme || "http")}" placeholder="http / socks5"></div>
-        </div>
-        <div class="row">
+        <div class="card"><h3>Xray 核心</h3>
           <div class="field"><label>Xray 路径（留空 = 自动）</label><input id="pool-xray-path" value="${esc(pool.xray_path || "")}" placeholder="留空自动下载到数据目录"></div>
-          <div class="field"><label>版本（留空 = latest）</label><input id="pool-xray-ver" value="${esc(pool.xray_version || "")}"></div>
-          <div class="field"><label>自动下载</label>${switchHTML("pool-xray-auto", pool.xray_auto_download)}</div>
+          <div class="row">
+            <div class="field"><label>版本（留空 = latest）</label><input id="pool-xray-ver" value="${esc(pool.xray_version || "")}"></div>
+            <div class="field"><label>自动下载</label>${switchHTML("pool-xray-auto", pool.xray_auto_download)}</div>
+          </div>
+          <div class="row mt"><button class="btn primary" data-pool-save>保存池配置</button></div>
+          <div class="dim mt">Xray：<span class="pill ${pool.xray.running ? "on" : "off"}">${pool.xray.running ? "运行中 · pid " + pool.xray.pid : "未运行"}</span>
+            ${pool.xray.error ? `<span style="color:var(--err)"> ${esc(pool.xray.error)}</span>` : ""}</div>
         </div>
-        <div class="row mt">
-          <button class="btn primary" id="pool-save">保存池配置</button>
-          <button class="btn" id="pool-refresh">刷新节点与健康检查</button>
-        </div>
-        <div class="dim mt">Xray：<span class="pill ${pool.xray.running ? "on" : "off"}">${pool.xray.running ? "运行中 · pid " + pool.xray.pid : "未运行"}</span>
-          ${pool.xray.error ? `<span style="color:var(--err)"> ${esc(pool.xray.error)}</span>` : ""}
-          ${pool.last_error ? `<br><span style="color:var(--err)">${esc(pool.last_error)}</span>` : ""}</div>
       </div>
-      <div class="card"><h3>节点与端点</h3>
+      <div class="card mt"><div class="toolbar"><h3 style="margin:0">节点与端点</h3>
         <div class="row"><input id="pool-name" placeholder="名称（字母数字-_）" style="width:180px">
           <input id="pool-link" placeholder="vless://… 或 ip:port 或 socks5://user:pass@host:port" style="flex:1;min-width:200px">
-          <button class="btn" id="pool-add">添加</button></div>
+          <button class="btn" id="pool-add">添加</button></div></div>
         <div class="table-wrap mt"><table><thead><tr><th>名称</th><th>类型</th><th>目标</th><th>健康</th><th class="num">延迟</th><th></th></tr></thead><tbody id="tb-pool"></tbody></table></div>
         <div class="dim mt">分享链接（vless / vmess / trojan / ss）由内置 Xray 核心承载；ip:port / socks5:// 等端点直接使用。</div>
       </div>
-    </div>
-    <div class="card mt"><div class="toolbar"><h3 style="margin:0">订阅</h3>
-      <div class="row"><input id="sub-name" placeholder="名称" style="width:150px">
-        <input id="sub-url" placeholder="https://…/sub?token=…" style="width:360px">
-        <input id="sub-int" type="number" min="5" value="60" title="刷新间隔（分钟）" style="width:90px">
-        <button class="btn" id="sub-add">添加订阅</button></div></div>
-      <div class="table-wrap mt"><table><thead><tr><th>名称</th><th>地址</th><th class="num">间隔</th><th class="num">节点</th><th>上次拉取</th><th></th></tr></thead><tbody id="tb-subs"></tbody></table></div>
-    </div>
-    <div class="card mt"><h3>站点绑定（按顺序，粘性选路）</h3>
-      <div class="table-wrap"><table><thead><tr><th>站点</th><th>绑定（逗号分隔：名称 或 sub:订阅名）</th><th>当前出口</th><th></th></tr></thead><tbody id="tb-bind"></tbody></table></div>
-      <div class="dim mt">未绑定、或绑定节点全部不健康时，回退到主线路 / 备用线路。Cookie 与出口 IP 绑定：切换出口后该站点会在下一轮巡检重新求解 Turnstile。</div>
+      <div class="card mt"><div class="toolbar"><h3 style="margin:0">订阅</h3>
+        <div class="row"><input id="sub-name" placeholder="名称" style="width:150px">
+          <input id="sub-url" placeholder="https://…/sub?token=…" style="width:360px">
+          <input id="sub-int" type="number" min="5" value="60" title="刷新间隔（分钟）" style="width:90px">
+          <button class="btn" id="sub-add">添加订阅</button></div></div>
+        <div class="table-wrap mt"><table><thead><tr><th>名称</th><th>地址</th><th class="num">间隔</th><th class="num">节点</th><th>上次拉取</th><th></th></tr></thead><tbody id="tb-subs"></tbody></table></div>
+      </div>
+      <div class="card mt"><h3>站点绑定（按顺序，粘性选路）</h3>
+        <div class="table-wrap"><table><thead><tr><th>站点</th><th>绑定（逗号分隔：名称 或 sub:订阅名）</th><th>当前出口</th><th></th></tr></thead><tbody id="tb-bind"></tbody></table></div>
+        <div class="dim mt">未绑定、或绑定节点全部不健康时，回退到主线路 / 备用线路。Cookie 与出口 IP 绑定：切换出口后该站点会在下一轮巡检重新求解 Turnstile。</div>
+      </div>
     </div>`;
 
   const renderFb = list => {
@@ -472,7 +492,8 @@ PAGES.proxy = async () => {
   };
   renderPool();
 
-  $("#pool-save").onclick = async () => {
+  // 「基础线路 / 代理池」两个按钮组各自带保存，共用同一提交逻辑
+  $$("[data-pool-save]").forEach(b => b.onclick = async () => {
     try {
       await api("/api/actions", { body: {
         action: "pool_set_config",
@@ -486,7 +507,7 @@ PAGES.proxy = async () => {
         xray_auto_download: $("#pool-xray-auto").checked } });
       toast("池配置已保存", "ok"); PAGES.proxy();
     } catch (e) { toast(e.message, "err"); }
-  };
+  });
   $("#pool-refresh").onclick = async () => {
     const b = $("#pool-refresh"); b.disabled = true; b.textContent = "刷新中…";
     try { await api("/api/actions", { body: { action: "pool_refresh" } }); toast("已在后台拉取订阅并检查健康，稍后重进本页查看", "ok"); PAGES.proxy(); }
@@ -533,6 +554,17 @@ PAGES.proxy = async () => {
     try { await api("/api/actions", { body: { action: "add_fallback", url: v } }); $("#px-fb").value = ""; PAGES.proxy(); }
     catch (e) { toast(e.message, "err"); }
   };
+
+  // 顶部页签切换：基础线路 / 代理池 两组卡片三选一显隐
+  const syncPx = () => {
+    $$("#px-seg button").forEach(b => b.classList.toggle("on", b.dataset.m === pxMode));
+    $$(".px-mode").forEach(el => { el.style.display = el.dataset.mode === pxMode ? "" : "none"; });
+    $("#px-hint").textContent = pxMode === "basic"
+      ? "上游请求的出口：主线路优先，失败或超时按备用线路顺序降级；限流与故障切换作用于全局。"
+      : "聚合分享链接与订阅节点，按站点粘性绑定出口；未绑定或全部不健康时回退到基础线路。";
+  };
+  $$("#px-seg button").forEach(b => b.onclick = () => { pxMode = b.dataset.m; syncPx(); });
+  syncPx();
 };
 
 async function merged(mutate) {
@@ -547,90 +579,95 @@ PAGES.turnstile = async () => {
   const t = ov.turnstile.config;
   view.innerHTML = `
     <div class="grid g2">
-      <div class="card"><h3>求解器配置</h3>
-        <div class="row">
-          <div class="field"><label>Token 获取方式</label><select id="ts-provider">
-            <option value="api">方式 1：求解服务 API</option>
-            <option value="browser">方式 2：本地浏览器自动获取</option>
-            <option value="manual">方式 3：手动导入 Cookie</option>
-          </select></div>
-          <div class="field"><label>启用</label>${switchHTML("ts-en", t.enabled)}</div>
-        </div>
-        <div id="ts-api" class="ts-panel">
-          <div class="ts-panel-title">方式 1 · 求解服务 API</div>
-          <div class="field"><label>求解服务 API URL</label><input id="ts-url" value="${esc(t.api_url)}"></div>
-          <div class="field"><label>API Key（留空保持不变）</label><input id="ts-key" value="" placeholder="已配置，输入以覆盖"></div>
-          <div class="row">
-            <div class="field"><label>Sitekey</label><input id="ts-sitekey" value="${esc(t.sitekey)}"></div>
-            <div class="field"><label>Action</label><input id="ts-action" value="${esc(t.action)}"></div>
+      <div class="grid" style="align-content:start">
+        <div class="card">
+          <h3>Token 获取方式</h3>
+          <div class="seg" id="ts-seg">
+            <button type="button" data-p="api">方式 1 · 求解服务 API</button>
+            <button type="button" data-p="browser">方式 2 · 本地浏览器</button>
+            <button type="button" data-p="manual">方式 3 · 手动导入 Cookie</button>
+          </div>
+          <div class="ts-mode mt" data-mode="api">
+            <div class="field"><label>求解服务 API URL</label><input id="ts-url" value="${esc(t.api_url)}"></div>
+            <div class="field"><label>API Key（留空保持不变）</label><input id="ts-key" value="" placeholder="已配置，输入以覆盖"></div>
             <div class="field"><label>API 风格</label><select id="ts-style">
               <option value="sync">sync（CapSolver 形状）</option>
               <option value="ezsolver">ezsolver（本地 EzSolver）</option>
             </select></div>
+            <div class="row">
+              <div class="field"><label>Sitekey</label><input id="ts-sitekey" value="${esc(t.sitekey)}"></div>
+              <div class="field"><label>Action</label><input id="ts-action" value="${esc(t.action)}"></div>
+            </div>
+            <div class="dim">Sitekey / Action 是全局兜底：站点未单独配置时，方式 2 的浏览器求解也用它们。</div>
           </div>
-        </div>
-        <div id="ts-browser" class="ts-panel" style="display:none">
-          <div class="ts-panel-title">方式 2 · 本地浏览器自动获取</div>
-          <div class="field"><label>浏览器路径（Chrome / Edge 可执行文件）</label>
-            <input id="ts-bpath" value="${esc(t.browser_path || "")}"
-              placeholder="C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"></div>
-          <div class="row">
-            <div class="field"><label>无头模式</label>${switchHTML("ts-bhead", !!t.browser_headless)}</div>
-            <div class="field"><label>时区（可选，按代理出口对齐）</label>
-              <input id="ts-btz" value="${esc(t.browser_timezone || "")}" placeholder="Asia/Tokyo"></div>
+          <div class="ts-mode" data-mode="browser" style="display:none">
+            <div class="field"><label>浏览器路径（Chrome / Edge 可执行文件）</label>
+              <input id="ts-bpath" value="${esc(t.browser_path || "")}"
+                placeholder="C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"></div>
+            <div class="row">
+              <div class="field"><label>无头模式</label>${switchHTML("ts-bhead", !!t.browser_headless)}</div>
+              <div class="field"><label>时区（可选，按代理出口对齐）</label>
+                <input id="ts-btz" value="${esc(t.browser_timezone || "")}" placeholder="Asia/Tokyo"></div>
+            </div>
+            <div class="row">
+              <div class="field"><label>Locale（可选）</label>
+                <input id="ts-bloc" value="${esc(t.browser_locale || "")}" placeholder="ja-JP"></div>
+              <div class="field"><label>用户数据目录（可选）</label>
+                <input id="ts-bprof" value="${esc(t.browser_user_data_dir || "")}" placeholder="留空 = 临时 profile"></div>
+            </div>
+            <div class="dim">CDP 直连浏览器，无需 Playwright / Docker；求解期间会短暂打开一个窗口（无头模式除外）。</div>
           </div>
-          <div class="row">
-            <div class="field"><label>Locale（可选）</label>
-              <input id="ts-bloc" value="${esc(t.browser_locale || "")}" placeholder="ja-JP"></div>
-            <div class="field"><label>用户数据目录（可选）</label>
-              <input id="ts-bprof" value="${esc(t.browser_user_data_dir || "")}" placeholder="留空 = 临时 profile"></div>
-          </div>
-          <div class="dim">CDP 直连浏览器，无需 Playwright / Docker；求解期间会短暂打开一个窗口（无头模式除外）。</div>
-        </div>
-        <div id="ts-manual" class="ts-panel" style="display:none">
-          <div class="ts-panel-title">方式 3 · 手动导入 Cookie</div>
-          <div class="row">
-            <div class="field"><label>Cookie TTL（秒）</label><input id="ts-ttl" type="number" value="${t.cookie_ttl_seconds}"></div>
+          <div class="ts-mode" data-mode="manual" style="display:none">
             <div class="field"><label>站点</label><select id="im-site">${
               (ov.sites || []).map(s => `<option value="${esc(s.code)}">${esc(s.code.toUpperCase())} · ${esc(s.base_url)}</option>`).join("")
             }</select></div>
+            <div class="field"><label>Cookie（name=value; name2=value2）</label><textarea id="im-cookies" style="min-height:96px"
+              placeholder="在已通过验证的浏览器里执行 document.cookie，或从开发者工具复制请求头 Cookie"></textarea></div>
+            <div class="dim">Cookie 与出口 IP / UA 绑定：请在同一代理线路的浏览器中获取。导入后在 TTL 内免求解。</div>
+            <button class="btn primary mt" id="im-save">导入</button>
           </div>
-          <div class="field"><label>Cookie（name=value; name2=value2）</label><textarea id="im-cookies" style="min-height:96px"
-            placeholder="在已通过验证的浏览器里执行 document.cookie，或从开发者工具复制请求头 Cookie"></textarea></div>
-          <div class="dim">Cookie 与出口 IP / UA 绑定：请在同一代理线路的浏览器中获取。导入后在 TTL 内免求解，状态见右侧「已验证 Cookie」。</div>
-          <button class="btn primary mt" id="im-save">导入</button>
+          <div class="dim" id="ts-hint" style="margin-top:10px"></div>
+          <button class="btn primary mt" id="ts-save">保存配置</button>
         </div>
-        <div class="ts-panel">
-          <div class="ts-panel-title">求解与 Cookie 池</div>
+
+        <div class="card ts-solve-only">
+          <h3>求解超时与重试</h3>
           <div class="row">
             <div class="field"><label>求解超时（秒）</label><input id="ts-timeout" type="number" min="5" max="600" value="${t.timeout_seconds || 90}"></div>
             <div class="field"><label>失败重试（次）</label><input id="ts-retries" type="number" min="1" max="20" value="${t.retries || 5}"></div>
             <div class="field"><label>重试退避（秒）</label><input id="ts-backoff" type="number" min="0" max="60" step="0.5" value="${t.retry_backoff_seconds == null ? 1.5 : t.retry_backoff_seconds}"></div>
           </div>
+          <div class="dim">只作用于自动求解（方式 1 / 2），手动导入不走这条路径。</div>
+        </div>
+
+        <div class="card">
+          <h3>Cookie 缓存（通用）</h3>
+          <div class="field"><label>Cookie TTL（秒）</label><input id="ts-ttl" type="number" value="${t.cookie_ttl_seconds}"></div>
+          <div class="dim">三种方式共用：自动求解出的与手动导入的 Cookie 都按此时长缓存，到期后自动重新获取。</div>
+        </div>
+      </div>
+
+      <div class="grid" style="align-content:start">
+        <div class="card"><h3>已验证 Cookie</h3>
+          <div id="ts-status" class="grid" style="gap:10px"></div>
+          <div class="row mt">
+            <button class="btn" id="ts-refresh">强制刷新全部</button>
+            <button class="btn danger" id="ts-clear">清空 Cookie</button>
+          </div>
+          <div class="dim mt">缓存 TTL ${t.cookie_ttl_seconds}s · 求解超时 ${t.timeout_seconds || 90}s · 重试 ${t.retries} 次</div>
+        </div>
+        <div class="card ts-solve-only"><h3>Cookie 池</h3>
           <div class="row">
-            <div class="field"><label>Cookie 池（后台预热）</label>${switchHTML("ts-warm", !!t.warm_enabled)}</div>
+            <div class="field"><label>后台预热</label>${switchHTML("ts-warm", !!t.warm_enabled)}</div>
             <div class="field"><label>预热阈值（剩余 %）</label><input id="ts-ratio" type="number" min="5" max="95" value="${Math.round((t.warm_ratio == null ? 0.3 : t.warm_ratio) * 100)}"></div>
             <div class="field"><label>检查间隔（秒）</label><input id="ts-check" type="number" min="5" max="3600" value="${t.warm_check_seconds || 60}"></div>
           </div>
-          <div class="dim">Cookie 池开启后：后台每隔检查间隔巡检一次，剩余 TTL 低于阈值时主动重解，请求路径不再等待求解耗时（manual 方式不预热）。</div>
+          <div class="dim" id="ts-pool-state" style="margin-top:10px"></div>
+          <div id="ts-pool" class="grid mt" style="gap:8px"></div>
         </div>
-        <div class="dim" id="ts-hint" style="margin-top:10px"></div>
-        <button class="btn primary mt" id="ts-save">保存配置</button>
-      </div>
-      <div class="card"><h3>已验证 Cookie</h3>
-        <div id="ts-status" class="grid" style="gap:10px"></div>
-        <div class="row mt">
-          <button class="btn" id="ts-refresh">强制刷新全部</button>
-          <button class="btn danger" id="ts-clear">清空 Cookie</button>
-        </div>
-        <div class="dim mt">缓存 TTL ${t.cookie_ttl_seconds}s · 求解超时 ${t.timeout_seconds || 90}s · 重试 ${t.retries} 次 · 退避 ${t.retry_backoff_seconds}s</div>
-      </div>
-      <div class="card"><h3>Cookie 池</h3>
-        <div class="dim" id="ts-pool-state"></div>
-        <div id="ts-pool" class="grid mt" style="gap:8px"></div>
       </div>
     </div>
-    <div class="card mt"><h3>求解历史</h3><div class="table-wrap"><table>
+    <div class="card mt ts-solve-only"><h3>求解历史</h3><div class="table-wrap"><table>
       <thead><tr><th>时间</th><th>站点</th><th>线路</th><th class="num">耗时</th><th>结果</th></tr></thead>
       <tbody id="ts-hist"></tbody></table></div></div>`;
 
@@ -671,7 +708,6 @@ PAGES.turnstile = async () => {
     }).join("") : '<div class="dim">暂无池内记录 — 开启预热并等待下一轮巡检</div>';
   };
   renderPool(ov);
-  overviewTimer = setInterval(() => { fetchOverview().then(renderPool).catch(() => {}); }, 5000);
 
   $$("[data-rf]").forEach(b => b.onclick = async () => {
     b.disabled = true;
@@ -679,30 +715,39 @@ PAGES.turnstile = async () => {
     catch (e) { toast(e.message, "err"); }
     b.disabled = false;
   });
-  $("#ts-provider").value = t.provider || "api";
+  // 所选方式存在局部变量里，seg 按钮只负责切换，不依赖隐藏的 select。
+  let provider = t.provider || "api";
   $("#ts-style").value = t.api_style === "ezsolver" ? "ezsolver" : "sync";
   const TS_HINTS = {
-    api: ["已开启：调用求解服务 API 获取 Turnstile Token", "已关闭：跳过 Turnstile 求解，直接请求上游站点"],
-    browser: ["已开启：用下方配置的本地浏览器自动求解 Token", "已关闭：跳过 Turnstile 求解，直接请求上游站点"],
-    manual: ["手动方式：不自动求解，导入已通过验证的 Cookie 即可（TTL 内免求解）", "已关闭：跳过 Turnstile 求解，直接请求上游站点"],
+    api: "调用求解服务 API 获取 Turnstile Token",
+    browser: "用下方配置的本地浏览器自动求解 Token",
+    manual: "不自动求解，导入已通过验证的 Cookie 即可（TTL 内免求解）",
   };
+  // 组件级显隐：方式 N 的字段只在选中时出现；超时重试 / 右侧池与历史
+  // 只在方式 1/2 出现；缓存卡与已验证 Cookie 恒显。求解恒开启，无开关。
   const syncProvider = () => {
-    const p = $("#ts-provider").value;
-    $("#ts-api").style.display = p === "api" ? "" : "none";
-    $("#ts-browser").style.display = p === "browser" ? "" : "none";
-    $("#ts-manual").style.display = p === "manual" ? "" : "none";
-    $("#ts-refresh").style.display = p === "manual" ? "none" : "";
-    const hints = TS_HINTS[p] || TS_HINTS.api;
-    $("#ts-hint").textContent = $("#ts-en").checked ? hints[0] : hints[1];
+    const solving = provider === "api" || provider === "browser";
+    $$("#ts-seg button").forEach(b => b.classList.toggle("on", b.dataset.p === provider));
+    $$(".ts-mode").forEach(el => { el.style.display = el.dataset.mode === provider ? "" : "none"; });
+    $$(".ts-solve-only").forEach(el => { el.style.display = solving ? "" : "none"; });
+    $("#ts-refresh").style.display = provider === "manual" ? "none" : "";
+    // Cookie 池卡片隐藏时连轮询一起停，manual 方式不再每 5s 拉一次 overview。
+    if (solving) {
+      if (!overviewTimer) overviewTimer = setInterval(() => { fetchOverview().then(renderPool).catch(() => {}); }, 5000);
+    } else if (overviewTimer) {
+      clearInterval(overviewTimer); overviewTimer = null;
+    }
+    $("#ts-hint").textContent = TS_HINTS[provider] || TS_HINTS.api;
   };
-  $("#ts-provider").onchange = syncProvider;
-  $("#ts-en").onchange = syncProvider;
+  $$("#ts-seg button").forEach(b => b.onclick = () => { provider = b.dataset.p; syncProvider(); });
   syncProvider();
   $("#ts-save").onclick = async () => {
     try {
       await api("/api/actions", { body: {
-        action: "set_turnstile", enabled: $("#ts-en").checked,
-        provider: $("#ts-provider").value,
+        // 求解恒开启：控制台不再提供关闭入口，保存时强制 enabled=true，
+        // 避免误关后所有站点悄悄退化成直连上游。
+        action: "set_turnstile", enabled: true,
+        provider,
         api_url: $("#ts-url").value.trim(),
         api_key: $("#ts-key").value.trim(), sitekey: $("#ts-sitekey").value.trim(),
         challenge_action: $("#ts-action").value.trim(), cookie_ttl_seconds: +$("#ts-ttl").value,
