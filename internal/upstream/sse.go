@@ -93,6 +93,14 @@ func translateEvent(eventType string, dataLines []string) ([]Event, error) {
 		return []Event{{Kind: KindDone}}, nil
 	}
 
+	// The quota notice may travel as its own event type with no "error"
+	// field at all, and the mirrors word it per locale. Recognise the
+	// envelope before the generic error gate so a localized notice is never
+	// swallowed as an ordinary (silent) delta.
+	if hasQuotaEnvelope(payload) {
+		return nil, newQuota("sse quota exhausted: " + shortJSON(payload))
+	}
+
 	if eventType == "error" || hasErrorValue(payload) {
 		if isQuotaPayload(payload) {
 			return nil, newQuota("sse quota exhausted: " + shortJSON(payload))

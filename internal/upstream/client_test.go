@@ -401,3 +401,118 @@ func TestQuotaRotationRecoversWithoutSolve(t *testing.T) {
 		t.Error("cooldown should be cleared once the site serves again")
 	}
 }
+
+// The three mirrors run the same server plugin in a different language, so a
+// notice that carries no quota_notice envelope still has to be recognised.
+func TestLocalizedQuotaNoticesAreQuotaErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		eventType string
+		payload   map[string]any
+	}{
+		{"de wording without envelope", "error", map[string]any{
+			"error": "Dein heutiges Guthaben von 30.000 Token (V4-Flash) ist aufgebraucht.",
+		}},
+		{"es wording", "error", map[string]any{
+			"error": "Tu saldo de tokens se ha agotado.",
+		}},
+		{"fr wording", "error", map[string]any{
+			"error": "Votre crédit de tokens est épuisé.",
+		}},
+		{"fr wording without accents", "error", map[string]any{
+			"error": "Votre credit de tokens est epuise pour aujourd'hui.",
+		}},
+		{"en wording", "error", map[string]any{
+			"error": "Your daily quota of tokens is exhausted.",
+		}},
+		{"notice event type without error field", "quota_notice", map[string]any{
+			"type":   "quota_notice",
+			"notice": map[string]any{"message": "Dein Guthaben ist aufgebraucht."},
+		}},
+		{"bare notice object without error field", "quota_notice", map[string]any{
+			"notice": map[string]any{"message": "Tu saldo de tokens se ha agotado."},
+		}},
+		{"nested data wording", "error", map[string]any{
+			"error": map[string]any{"code": "quota_exhausted"},
+			"data":  map[string]any{"message": "Le quota de tokens est consommé pour aujourd'hui."},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := json.Marshal(tc.payload)
+			_, err := translateEvent(tc.eventType, []string{string(raw)})
+			if err == nil {
+				t.Fatal("expected an error, got none (the notice was swallowed)")
+			}
+			if !isQuota(err) {
+				t.Fatalf("want QuotaExhaustedError, got %T: %v", err, err)
+			}
+			if isSession(err) {
+				t.Error("quota error must not be classified as a session error")
+			}
+		})
+	}
+}
+
+func TestDeltaMentioningQuotaStaysDelta(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{"delta": "So prüfst du dein Guthaben: quota balance"})
+	evs, err := translateEvent("message", []string{string(raw)})
+	if err != nil {
+		t.Fatalf("a chat delta must never classify as an error: %v", err)
+	}
+	if len(evs) != 1 || evs[0].Kind != KindDelta {
+		t.Fatalf("events = %+v, want a single delta", evs)
+	}
+}
+
+// The allowance can also trip at the cache step, where the body carries
+// success:false plus a localized message and no quota_notice envelope.
+func TestCacheMessageLocalizedQuotaIsQuotaError(t *testing.T) {
+	bodies := []string{
+		`{"success":false,"data":{"code":"quota_exhausted","message":"Tu saldo de tokens se ha agotado."}}`,
+		`{"success":false,"data":{"message":"Votre crédit de tokens est épuisé."}}`,
+		`{"success":false,"error":"Dein heutiges Guthaben ist aufgebraucht."}`,
+	}
+	for _, body := range bodies {
+		if !isQuotaPayload(jsonPayload([]byte(body))) {
+			t.Errorf("body %s was not classified as quota", body)
+		}
+	}
+	if isQuotaPayload(jsonPayload([]byte(`{"success":false,"data":{"code":"empty_data_to_cache"}}`))) {
+		t.Error("cache rejection must not be classified as quota")
+	}
+}
+
+// Rotation must not depend on the refresh/retry machinery: with auto_refresh
+// off the exhausted site still swaps in a fresh visitor id so the next request
+// is billed to a balance that is not already spent.
+func TestQuotaRotatesVisitorIdentityWithoutRefreshRetries(t *testing.T) {
+	cfg := testConfig(t) // AutoRefresh=false, RefreshRetries=0
+	solver := turnstile.New(cfg.Turnstile, httpx.DefaultUserAgent)
+	const oldGid = "OLDGIDOLDGIDOLDGIDOLDGIDOLDG12"
+	if _, _, err := solver.ImportCookies("de", "cf_clearance=abc; dsgt_gid="+oldGid, ""); err != nil {
+		t.Fatalf("seed cookies: %v", err)
+	}
+	for _, code := range []string{"es", "fr"} {
+		cfg.Sites[code].Enabled = false
+	}
+	c := New(cfg, solver, nil, nil)
+	c.chatOnceOverride = func(_ context.Context, site config.Site, modelID string, model config.Model,
+		_ string, _ Route, _ *ServeInfo, _ func(Event) error) error {
+		return newQuota("sse quota exhausted: test")
+	}
+	err := c.Chat(context.Background(), "deepseek-v4-flash-de", "p", nil, func(Event) error { return nil })
+	if err == nil {
+		t.Fatal("expected the quota error to surface once mirrors are disabled")
+	}
+	if !isQuota(err) {
+		t.Fatalf("want QuotaExhaustedError, got %T: %v", err, err)
+	}
+	gid, ok := solver.GuestID("de", "")
+	if !ok {
+		t.Fatal("guest id lost after rotation")
+	}
+	if gid == oldGid {
+		t.Fatal("visitor id was not rotated: rotation must not wait for a refresh retry")
+	}
+}

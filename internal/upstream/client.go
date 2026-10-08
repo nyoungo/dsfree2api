@@ -424,6 +424,7 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 
 	var lastErr error
 	sawQuota := false
+	rotatedQuota := false
 	for attempt := 0; ; attempt++ {
 		var failed []Route
 		for i, route := range routes {
@@ -481,6 +482,21 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 			c.logUpstreamErr(site.Code, modelID, attempt, route, err)
 			if isQuota(err) {
 				sawQuota = true
+				// The free daily tier is keyed to the visitor cookie, so a
+				// brand-new visitor id restores it instantly — the same
+				// effect as a fresh private window. Rotate the moment the
+				// site reports exhaustion, before the backoff wait and
+				// before the next route/attempt, so the retry (and any
+				// sibling route tried right after) is billed to a balance
+				// that is not already spent. This also runs when
+				// auto_refresh is off, leaving the new identity in place
+				// for the next request instead of the expired one.
+				if !rotatedQuota && c.ts != nil {
+					rotatedQuota = true
+					if gid := c.ts.RotateGuest(site.Code); gid != "" {
+						c.log.Info("rotated visitor identity", "site", site.Code, "reason", "quota")
+					}
+				}
 			}
 			if i < len(routes)-1 {
 				continue
@@ -506,17 +522,10 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 			// Session errors need a fresh cookie right away. Quota errors
 			// often clear once the cached chat config is dropped, so the
 			// first cycle retries cheaply and only the second one pays for
-			// a Turnstile re-solve.
+			// a Turnstile re-solve. The visitor id was already swapped the
+			// moment exhaustion was detected; a full re-solve (attempt >= 1)
+			// is the slower fallback for when that alone was not enough.
 			forceCookie := isSession(lastErr) || (isQuota(lastErr) && attempt >= 1)
-			// The free daily tier is keyed to the visitor cookie: swapping
-			// in a brand-new visitor id restores it instantly, the same
-			// effect as a fresh private window. Only a re-solve (attempt
-			// >= 1) then remains as the slower fallback.
-			if isQuota(lastErr) && attempt == 0 && c.ts != nil {
-				if gid := c.ts.RotateGuest(site.Code); gid != "" {
-					c.log.Info("rotated visitor identity", "site", site.Code, "reason", "quota")
-				}
-			}
 			for _, route := range failed {
 				if err := c.refreshSession(ctx, site, modelID, route, forceCookie); err != nil {
 					c.log.Warn("session refresh failed", "model", modelID, "error", err)
@@ -694,6 +703,13 @@ func (c *Client) chatOnce(
 		if resp.Status == 403 || resp.Status == 401 {
 			return newSession(fmt.Sprintf("cache message http %d", resp.Status))
 		}
+		// The allowance check can trip at the cache step too (the site
+		// counts the prompt against the daily total before streaming), and
+		// the mirrors word it per locale — classify it instead of letting
+		// it surface as a generic error that neither rotates nor fails over.
+		if p := jsonPayload(resp.Body); isQuotaPayload(p) {
+			return newQuota("cache message quota exhausted: " + truncate(string(resp.Body), 400))
+		}
 		return errf("cache message http %d: %s", resp.Status, truncate(string(resp.Body), 400))
 	}
 
@@ -708,8 +724,10 @@ func (c *Client) chatOnce(
 		if code := extractCode(init.Data); code != "" && strings.Contains(strings.ToLower(code), "nonce") {
 			c.dropChatCfg(modelID, route)
 		}
-		payload := map[string]any{}
-		_ = json.Unmarshal(resp.Body, &payload)
+		payload := jsonPayload(resp.Body)
+		if isQuotaPayload(payload) {
+			return newQuota("cache message quota exhausted: " + truncate(string(resp.Body), 400))
+		}
 		if isSessionPayload(payload) {
 			return newSession("cache message session failed: " + truncate(string(resp.Body), 400))
 		}
