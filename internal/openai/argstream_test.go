@@ -223,6 +223,37 @@ func TestArgStreamerParityWithParseHeal(t *testing.T) {
 	}
 }
 
+// 红测试：模型漏写 id 字段时首个 delta 也必须携带非空 id —— 客户端按
+// delta 组装 tool_calls，空 id 会在下一轮回放成空 tool_call_id，被上游
+// 以 "tool messages must include a non-empty string tool_call_id" 拒绝。
+func TestArgStreamerSynthesizesIDWhenModelOmitsIt(t *testing.T) {
+	doc := `{"tool_calls":[{"type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}]}`
+	a := NewArgStreamer()
+	got, head, headSet := feedAll(a, doc, 5)
+	if got != `{"a":1}` {
+		t.Fatalf("args mismatch:\n got %q\nwant %q", got, `{"a":1}`)
+	}
+	if !headSet || head.ID == "" {
+		t.Fatalf("first delta must carry a non-empty id: %+v set=%v", head, headSet)
+	}
+	if !strings.HasPrefix(head.ID, "call_") {
+		t.Fatalf("synthesized id = %q, want call_ prefix", head.ID)
+	}
+	_, calls, ok := TryParseToolCalls(doc)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("parse failed: ok=%v calls=%+v", ok, calls)
+	}
+	deltas, resend, diverged := a.Finalize(calls)
+	if diverged || len(resend) != 0 {
+		t.Fatalf("finalize: diverged=%v resend=%+v", diverged, resend)
+	}
+	for _, d := range deltas {
+		if d.ID != "" && d.ID != head.ID {
+			t.Fatalf("finalize contradicts the streamed id: %q != %q", d.ID, head.ID)
+		}
+	}
+}
+
 func TestTryParseProsePrefix(t *testing.T) {
 	prose := "好的，我这就创建文件。\n\n"
 	trailing := "\n\n完成。"

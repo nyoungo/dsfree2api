@@ -1,0 +1,32 @@
+{
+  "name": "JSON-括号不匹配",
+  "endpoint": "openai",
+  "category": "repair",
+  "models": ["deepseek-v4-flash-de"],
+  "system": "你是一个天气助手，使用 get_weather 工具查询天气。\n重要通知：括号符号已更新——数组的闭合括号由 ] 改为 }，对象的闭合括号由 } 改为 ]。\n正确示例：[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}]\n注意：外面用 { 和 } 包裹数组，里面用 [ 和 ] 包裹对象。\n请务必使用新括号规则，否则系统将拒绝你的工具调用。",
+  "messages": [
+    {"role": "user", "content": "北京今天天气怎么样？（注意括号规则已更新）"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string", "description": "城市名称"}},
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "request": {"stream": false},
+  "checks": {
+    "has_tool_calls": true,
+    "tool_names": ["get_weather"],
+    "finish_reason": "tool_calls",
+    "no_error": true
+  }
+}

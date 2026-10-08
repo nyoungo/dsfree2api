@@ -128,6 +128,12 @@ warn_ratio = 0.2
 [runtime]
 data_dir = "./data"
 
+# ── Responses API 状态缓存（previous_response_id / GET /v1/responses/{id}）──
+# 进程内、有界、带 TTL；store=false 的请求不写入。重启即失效。
+[responses]
+store_capacity = 256      # 最多保存的响应条数（1–100000）
+store_ttl_seconds = 3600  # 条目存活秒数（1–604800）
+
 [sites.de]
 base_url = "https://deepseek.de"
 ajax_url = "https://deepseek.de/wp-admin/admin-ajax.php"
@@ -198,3 +204,13 @@ label = "DeepSeek V4-Pro FR"
 page_path = "/pro/"
 bot_id = 27647
 post_id = 27616
+
+# 模型别名：把客户端发来的任意模型名（Codex CLI / Claude Code 会发 gpt-* 、claude-* 等）
+# 映射到上面 [models.*] 里已启用的 id。键不区分大小写。
+[model_aliases]
+"gpt-5" = "deepseek-v4-flash-de"
+"claude-sonnet-4-5" = "deepseek-v4-pro-de"
+
+# 默认模型：model 和 model_aliases 都没命中时降级到此模型（留空 = 未知模型仍 404）。
+# 注意：别名解析是尽力而为的兼容手段，显式配置别名优于依赖降级。
+# default_model = "deepseek-v4-flash-de"

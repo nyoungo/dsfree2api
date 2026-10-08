@@ -26,6 +26,10 @@ type Server struct {
 	log   *slog.Logger
 	lim   *limiter
 	start time.Time
+	// rstore backs previous_response_id / GET /v1/responses/{id}.
+	rstore *responseStore
+	// idem backs Idempotency-Key replay.
+	idem *idempotencyStore
 }
 
 func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *logbuf.Buffer, ts *turnstile.Solver, log *slog.Logger) *Server {
@@ -34,8 +38,10 @@ func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *l
 	}
 	return &Server{
 		cfg: cfg, up: up, met: met, logs: logs, ts: ts, log: log,
-		lim:   newLimiter(),
-		start: time.Now(),
+		lim:    newLimiter(),
+		start:  time.Now(),
+		rstore: newResponseStore(cfg.Responses.StoreCapacityValue(), cfg.Responses.StoreTTLValue()),
+		idem:   newIdempotencyStore(),
 	}
 }
 
@@ -46,8 +52,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/models", s.authed(s.handleModels))
 	mux.HandleFunc("POST /v1/chat/completions", s.authed(s.handleChat))
 	mux.HandleFunc("POST /v1/responses", s.authed(s.handleResponses))
+	mux.HandleFunc("GET /v1/responses/{id}", s.authed(s.handleGetResponse))
 	mux.HandleFunc("POST /v1/messages", s.authedAnthropic(s.handleMessages))
-	return s.recoverPanic(s.logRequest(mux))
+	return s.recoverPanic(s.logRequest(s.idempotency(mux)))
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
@@ -83,12 +90,32 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	s.cfg.RLock()
 	now := time.Now().Unix()
 	data := make([]map[string]any, 0, len(s.cfg.Models))
+	seen := make(map[string]struct{}, len(s.cfg.Models))
 	for id, m := range s.cfg.Models {
 		if !m.Enabled {
 			continue
 		}
+		seen[strings.ToLower(id)] = struct{}{}
 		data = append(data, map[string]any{
 			"id": id, "object": "model", "created": now, "owned_by": "deepseek-" + m.Site,
+		})
+	}
+	// Aliases are resolvable model names too: listing them lets Codex CLI /
+	// Claude Code discover that their arbitrary model name works here.
+	for alias, target := range s.cfg.ModelAliases {
+		if alias == "" {
+			continue
+		}
+		if _, dup := seen[strings.ToLower(alias)]; dup {
+			continue
+		}
+		m, ok := s.cfg.Models[target]
+		if !ok || !m.Enabled {
+			continue
+		}
+		seen[strings.ToLower(alias)] = struct{}{}
+		data = append(data, map[string]any{
+			"id": alias, "object": "model", "created": now, "owned_by": "deepseek-" + m.Site,
 		})
 	}
 	s.cfg.RUnlock()
@@ -169,12 +196,17 @@ func (s *Server) logRequest(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		rid := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+		if rid == "" {
+			rid = "req_" + randHex(8)
+		}
+		w.Header().Set("X-Request-Id", rid)
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		defer func() {
 			if r.URL.Path != "/" {
 				s.log.Debug("http",
-					"method", r.Method, "path", r.URL.Path,
+					"req", rid, "method", r.Method, "path", r.URL.Path,
 					"status", sw.status, "ms", time.Since(start).Milliseconds())
 			}
 		}()
@@ -249,10 +281,48 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeError renders an OpenAI-shaped error. The OpenAI schema always carries
+// param and code (null when not applicable); clients such as the OpenAI SDKs
+// read code to distinguish e.g. model_not_found from a generic 404.
 func writeError(w http.ResponseWriter, code int, msg, typ string) {
-	writeJSON(w, code, map[string]any{
-		"error": map[string]any{"message": msg, "type": typ},
-	})
+	param, errCode := errorParamCode(code, typ, msg)
+	body := map[string]any{"message": msg, "type": typ}
+	if param != "" {
+		body["param"] = param
+	} else {
+		body["param"] = nil
+	}
+	if errCode != "" {
+		body["code"] = errCode
+	} else {
+		body["code"] = nil
+	}
+	writeJSON(w, code, map[string]any{"error": body})
+}
+
+// errorParamCode maps an error onto the OpenAI (param, code) pair.
+func errorParamCode(status int, typ, msg string) (param, code string) {
+	if typ == "idempotency_error" {
+		return "", "idempotency_error"
+	}
+	switch {
+	case status == http.StatusUnauthorized:
+		return "", "invalid_api_key"
+	case status == http.StatusNotFound && strings.HasPrefix(msg, "model not found"):
+		return "model", "model_not_found"
+	case status == http.StatusTooManyRequests:
+		return "", "rate_limit_exceeded"
+	case status == http.StatusRequestEntityTooLarge:
+		return "", "request_too_large"
+	case status == http.StatusBadGateway:
+		if typ == "upstream_empty_response" {
+			return "", "upstream_empty_response"
+		}
+		return "", "upstream_error"
+	case status == http.StatusGatewayTimeout:
+		return "", "upstream_timeout"
+	}
+	return "", ""
 }
 
 // maxRequestBodyBytes caps every public endpoint's body: these endpoints are

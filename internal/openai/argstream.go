@@ -131,6 +131,18 @@ func (a *ArgStreamer) Feed(text string) []ToolArgDelta {
 			d.Args = args
 			send = true
 		}
+		if send && a.idSent[i] == "" {
+			// The model's payload carries no id (yet): the first delta for an
+			// index must still carry a non-empty one — clients assemble
+			// tool_calls from deltas and echo the id back as tool_call_id on
+			// the next turn, where an empty id fails strict validation with
+			// "tool messages must include a non-empty string tool_call_id".
+			d.ID = st.id
+			if d.ID == "" {
+				d.ID = "call_" + randomHex(8)
+			}
+			a.idSent[i] = d.ID
+		}
 		a.sent[i] = emit
 		a.derived[i] = st.derived
 		if send {

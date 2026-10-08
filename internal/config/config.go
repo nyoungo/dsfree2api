@@ -135,6 +135,46 @@ const (
 	DefaultQuotaWarnRatio    = 0.2
 )
 
+// Responses store defaults: an in-process, bounded, TTL cache backs
+// previous_response_id and GET /v1/responses/{id}.
+const (
+	DefaultResponsesStoreCapacity   = 256
+	DefaultResponsesStoreTTLSeconds = 3600
+)
+
+// ResponsesConfig tunes the Responses API stateful cache.
+type ResponsesConfig struct {
+	StoreCapacity   int `toml:"store_capacity" json:"store_capacity"`
+	StoreTTLSeconds int `toml:"store_ttl_seconds" json:"store_ttl_seconds"`
+}
+
+// StoreCapacityValue normalizes store_capacity (default 256, clamped 1–100000).
+func (r ResponsesConfig) StoreCapacityValue() int {
+	n := r.StoreCapacity
+	if n <= 0 {
+		return DefaultResponsesStoreCapacity
+	}
+	if n > 100000 {
+		return 100000
+	}
+	return n
+}
+
+// StoreTTLValue normalizes store_ttl_seconds (default 1h, clamped 1s–7d).
+func (r ResponsesConfig) StoreTTLValue() time.Duration {
+	n := r.StoreTTLSeconds
+	if n <= 0 {
+		n = DefaultResponsesStoreTTLSeconds
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 7*24*3600 {
+		n = 7 * 24 * 3600
+	}
+	return time.Duration(n) * time.Second
+}
+
 // QuotaWatch configures the guest-token balance sentinel: it polls each
 // site's balance endpoint with the pooled session (same egress and cookies as
 // chat) and reports remaining daily quota to the console and logs.
@@ -268,6 +308,9 @@ type Config struct {
 	// so the console shows how much daily free quota is left.
 	Quota QuotaWatch `toml:"quota" json:"quota"`
 
+	// Responses backs previous_response_id / GET /v1/responses/{id}.
+	Responses ResponsesConfig `toml:"responses" json:"responses"`
+
 	Upstream struct {
 		Timeout             float64 `toml:"timeout" json:"timeout"`
 		StreamTimeout       float64 `toml:"stream_timeout" json:"stream_timeout"`
@@ -287,6 +330,14 @@ type Config struct {
 	Turnstile Turnstile         `toml:"turnstile" json:"turnstile"`
 	Sites     map[string]*Site  `toml:"sites" json:"sites"`
 	Models    map[string]*Model `toml:"models" json:"models"`
+
+	// ModelAliases maps an arbitrary client-supplied model name (e.g. the
+	// gpt-* / claude-* names Codex CLI or Claude Code send) onto a configured
+	// model id. Looked up case-insensitively before DefaultModel kicks in.
+	ModelAliases map[string]string `toml:"model_aliases" json:"model_aliases"`
+	// DefaultModel is the fallback when neither Models nor ModelAliases
+	// matches a request. Empty disables the fallback (unknown model = 404).
+	DefaultModel string `toml:"default_model" json:"default_model"`
 
 	mu   sync.RWMutex `toml:"-"`
 	path string       `toml:"-"`
@@ -386,6 +437,8 @@ func newConfig() *Config {
 	c.Runtime.DataDir = "./data"
 	c.ProxyPool = DefaultProxyPool()
 	c.Turnstile = DefaultTurnstile()
+	c.Responses.StoreCapacity = DefaultResponsesStoreCapacity
+	c.Responses.StoreTTLSeconds = DefaultResponsesStoreTTLSeconds
 	c.Sites = DefaultSites(c.Turnstile.SiteKey)
 	c.Models = DefaultModels()
 	return c
@@ -678,6 +731,27 @@ func (c *Config) validateLocked() error {
 		}
 		seen[k] = true
 	}
+	for alias, target := range c.ModelAliases {
+		if alias == "" {
+			return errors.New("model_aliases: alias name must not be empty")
+		}
+		m, ok := c.Models[target]
+		if !ok {
+			return fmt.Errorf("model_aliases[%q]: unknown model %q", alias, target)
+		}
+		if !m.Enabled {
+			return fmt.Errorf("model_aliases[%q]: model %q is disabled", alias, target)
+		}
+	}
+	if c.DefaultModel != "" {
+		m, ok := c.Models[c.DefaultModel]
+		if !ok {
+			return fmt.Errorf("default_model: unknown model %q", c.DefaultModel)
+		}
+		if !m.Enabled {
+			return fmt.Errorf("default_model: model %q is disabled", c.DefaultModel)
+		}
+	}
 	return nil
 }
 
@@ -729,6 +803,43 @@ func (c *Config) Site(code string) (*Site, bool) {
 func (c *Config) Model(id string) (*Model, bool) {
 	m, ok := c.Models[id]
 	return m, ok
+}
+
+// ResolveModel maps a client-supplied model name onto a configured model.
+// Resolution order: exact id → case-insensitive id → model_aliases
+// (case-insensitive) → DefaultModel fallback. Must hold at least a read lock.
+//
+// An exact id that exists but is disabled is never aliased away — the admin
+// turned it off on purpose, so the caller gets ok=false (404). ok=false means
+// the name is genuinely unknown and the caller should reject the request.
+// resolved is the configured id the caller must use for upstream routing and
+// metrics; it equals the requested name when no aliasing happened.
+func (c *Config) ResolveModel(id string) (m *Model, resolved string, ok bool) {
+	if m, hit := c.Models[id]; hit {
+		if m.Enabled {
+			return m, id, true
+		}
+		return nil, "", false
+	}
+	for candidate, m := range c.Models {
+		if strings.EqualFold(candidate, id) && m.Enabled {
+			return m, candidate, true
+		}
+	}
+	for alias, target := range c.ModelAliases {
+		if strings.EqualFold(alias, id) {
+			if m, hit := c.Models[target]; hit && m.Enabled {
+				return m, target, true
+			}
+			return nil, "", false
+		}
+	}
+	if c.DefaultModel != "" {
+		if m, hit := c.Models[c.DefaultModel]; hit && m.Enabled {
+			return m, c.DefaultModel, true
+		}
+	}
+	return nil, "", false
 }
 
 // Save writes the config back to its file after taking a timestamped backup.

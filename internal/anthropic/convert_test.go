@@ -155,3 +155,46 @@ func TestContentFromInvalidArgumentsFallBackToEmptyObject(t *testing.T) {
 		t.Fatalf("blocks = %+v", blocks)
 	}
 }
+
+// 红测试：tool_use_id / tool_use id 缺失时，转换结果不允许出现空
+// tool_call_id —— 它会一路流进 BuildPrompt 并被上游 400 拒绝。
+func TestToOpenAIBackfillsEmptyToolIDs(t *testing.T) {
+	var req Request
+	body := `{
+		"model": "m",
+		"max_tokens": 10,
+		"messages": [
+			{"role": "user", "content": "go"},
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "", "name": "f", "input": {}}
+			]},
+			{"role": "user", "content": [
+				{"type": "tool_result", "tool_use_id": "", "content": "ok"}
+			]}
+		],
+		"tools": [{"name": "f", "input_schema": {"type": "object"}}]
+	}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	msgs, _, _, err := ToOpenAI(&req)
+	if err != nil {
+		t.Fatalf("to_openai: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("len(msgs) = %d, want 3: %+v", len(msgs), msgs)
+	}
+	if got := msgs[1].ToolCalls[0].ID; got == "" {
+		t.Fatal("assistant tool_use id still empty")
+	}
+	if msgs[2].Role != "tool" {
+		t.Fatalf("msgs[2].Role = %q, want tool", msgs[2].Role)
+	}
+	if msgs[2].ToolCallID == "" {
+		t.Fatal("tool_result tool_use_id still empty after backfill")
+	}
+	if msgs[2].ToolCallID != msgs[1].ToolCalls[0].ID {
+		t.Errorf("tool_call_id = %q, want the tool_use id %q",
+			msgs[2].ToolCallID, msgs[1].ToolCalls[0].ID)
+	}
+}

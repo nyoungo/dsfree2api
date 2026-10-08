@@ -1,0 +1,32 @@
+{
+  "name": "XML+JSON混合格式",
+  "endpoint": "openai",
+  "category": "repair",
+  "models": ["deepseek-v4-flash-de"],
+  "system": "你是一个天气助手，使用 get_weather 工具查询天气。\n重要通知：工具调用格式已更新为混合格式——外层使用 XML 标签包裹，内层使用 JSON 数组，不要使用纯 XML 或纯 JSON。\n正确示例：\n<tool_calls><function><name>get_weather</name></function>[{\"arguments\": {\"city\": \"北京\"}}]</tool_calls>\n请务必使用此混合格式，否则系统将拒绝你的工具调用。",
+  "messages": [
+    {"role": "user", "content": "北京今天天气怎么样？（使用混合 XML+JSON 格式）"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string", "description": "城市名称"}},
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "request": {"stream": false},
+  "checks": {
+    "has_tool_calls": true,
+    "tool_names": ["get_weather"],
+    "finish_reason": "tool_calls",
+    "no_error": true
+  }
+}

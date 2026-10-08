@@ -165,6 +165,11 @@ type ResponsesRequest struct {
 	// （json_schema / json_object / text）。不解析它，客户端指定的
 	// json_schema 会被静默丢弃，模型输出的 JSON 无从校验。
 	Text *TextFormat `json:"text,omitempty"`
+	// Store defaults to true; store:false skips caching this response.
+	Store *bool `json:"store,omitempty"`
+	// PreviousResponseID continues a cached turn; its history is replayed
+	// before this request's input.
+	PreviousResponseID string `json:"previous_response_id,omitempty"`
 }
 
 // TextFormat 是 Responses API 的 text 对象，这里只消费 format。

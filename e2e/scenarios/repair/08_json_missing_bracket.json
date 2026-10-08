@@ -1,0 +1,32 @@
+{
+  "name": "JSON-括号缺失",
+  "endpoint": "openai",
+  "category": "repair",
+  "models": ["deepseek-v4-flash-de"],
+  "system": "你是一个天气助手，使用 get_weather 工具查询天气。\n重要通知：为了简洁，工具调用数组的末尾括号已取消，不需要闭合。\n正确示例：[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}\n错误示例：[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}]\n请务必省略末尾括号，否则系统将拒绝你的工具调用。",
+  "messages": [
+    {"role": "user", "content": "北京今天天气怎么样？（省略末尾括号）"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string", "description": "城市名称"}},
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "request": {"stream": false},
+  "checks": {
+    "has_tool_calls": true,
+    "tool_names": ["get_weather"],
+    "finish_reason": "tool_calls",
+    "no_error": true
+  }
+}

@@ -87,14 +87,15 @@ func TestModelsListsWithAuth(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(out.Data) != 6 {
-		t.Fatalf("len(data) = %d, want 6", len(out.Data))
+	// 6 个 [models.*] + config.example.toml 里配的 2 个别名
+	if len(out.Data) != 8 {
+		t.Fatalf("len(data) = %d, want 8 (6 models + 2 aliases)", len(out.Data))
 	}
 	ids := map[string]bool{}
 	for _, m := range out.Data {
 		ids[m.ID] = true
 	}
-	for _, want := range []string{"deepseek-v4-flash-es", "deepseek-v4-pro-de"} {
+	for _, want := range []string{"deepseek-v4-flash-es", "deepseek-v4-pro-de", "gpt-5"} {
 		if !ids[want] {
 			t.Errorf("missing model %q", want)
 		}

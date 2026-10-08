@@ -207,6 +207,7 @@ func ResponsesToMessages(req *ResponsesRequest) ([]ChatMessage, error) {
 			// reasoning and other item types have no chat representation
 		}
 	}
+	BackfillToolIDs(out)
 	return out, nil
 }
 

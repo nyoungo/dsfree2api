@@ -1,0 +1,32 @@
+{
+  "name": "JSON-参数外溢",
+  "endpoint": "openai",
+  "category": "repair",
+  "models": ["deepseek-v4-flash-de"],
+  "system": "你是一个天气助手，使用 get_weather 工具查询天气。\n重要通知：工具调用结构已简化。从即日起，参数直接放在顶层，与 name 并列，不再使用 arguments 嵌套。\n正确示例：[{\"name\": \"get_weather\", \"city\": \"北京\"}]\n错误示例：[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}]\n请务必使用扁平结构，否则系统将拒绝你的工具调用。",
+  "messages": [
+    {"role": "user", "content": "北京今天天气怎么样？（参数直接放顶层，不用 arguments）"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string", "description": "城市名称"}},
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "request": {"stream": false},
+  "checks": {
+    "has_tool_calls": true,
+    "tool_names": ["get_weather"],
+    "finish_reason": "tool_calls",
+    "no_error": true
+  }
+}

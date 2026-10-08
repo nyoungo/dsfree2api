@@ -28,7 +28,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.RLock()
-	m, ok := s.cfg.Models[req.Model]
+	m, resolvedID, ok := s.cfg.ResolveModel(req.Model)
 	site := ""
 	enabled := false
 	if ok {
@@ -39,6 +39,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok || !enabled {
 		writeAnthropicError(w, http.StatusNotFound, "model not found: "+req.Model, "not_found_error")
 		return
+	}
+	if resolvedID != req.Model {
+		s.log.Info("model aliased", "requested", req.Model, "resolved", resolvedID)
+		req.Model = resolvedID
 	}
 
 	messages, tools, toolChoice, err := anthropic.ToOpenAI(&req)
@@ -392,7 +396,7 @@ func splitToolOutput(body string, tools []openai.ToolDef) (string, []openai.Tool
 	if len(tools) == 0 {
 		return body, nil
 	}
-	remaining, calls, ok := openai.TryParseToolCalls(body)
+	remaining, calls, ok := openai.TryParseToolCallsForTools(body, tools)
 	if !ok {
 		return body, nil
 	}

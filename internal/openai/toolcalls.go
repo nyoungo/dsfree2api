@@ -4,133 +4,87 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
+// Special begin/end markers DeepSeek emits around a tool-call block. The
+// separators use U+2581 / U+FF5C lookalikes, so tag matching normalizes them.
+const (
+	toolCallStart = "<|tool▁calls▁begin|>"
+	toolCallEnd   = "<|tool▁calls▁end|>"
+)
+
+// builtinStartTags / builtinEndTags mirror the reference defaults: the special
+// tokens plus the <tool_call>/<tool_calls> XML wrappers models hallucinate.
+var (
+	builtinStartTags = []string{toolCallStart, "<|tool_call_begin|>", "<tool_calls>", "<tool_call>"}
+	builtinEndTags   = []string{toolCallEnd, "<|tool_call_end|>", "</tool_calls>", "</tool_call>"}
+)
+
+// ParseOptions tunes tool-call extraction. ExtraStarts/ExtraEnds add tag
+// wrappers beyond the built-ins; ToolNames lets the loose bare/spilled-object
+// repair require a name that actually matches an offered tool.
+type ParseOptions struct {
+	ExtraStarts []string
+	ExtraEnds   []string
+	ToolNames   []string
+}
+
+func optionsForTools(tools []ToolDef) ParseOptions {
+	opts := ParseOptions{}
+	for _, t := range tools {
+		if n := strings.TrimSpace(t.Function.Name); n != "" {
+			opts.ToolNames = append(opts.ToolNames, n)
+		}
+	}
+	return opts
+}
+
 // TryParseToolCalls extracts an OpenAI-style tool_calls object from raw model
-// output. It mirrors the Python implementation: plain JSON, ```json fences and
-// generic ``` fences are all candidates.
+// output. It mirrors the Python/Rust implementations: plain JSON, ```json
+// fences, generic ``` fences, XML/<tool_call>/<invoke> wrappers and the usual
+// model repairs (unquoted keys, invalid backslashes, field aliases,
+// swapped/ spilled arguments) are all accepted.
 //
 // Returns the remaining prose plus the parsed tool calls (ok=false when the
 // text is ordinary chat).
 func TryParseToolCalls(text string) (string, []ToolCall, bool) {
-	trimmed := strings.TrimSpace(text)
-	var candidates []string
-	if strings.HasPrefix(trimmed, "{") {
-		candidates = append(candidates, trimmed)
-	} else if i := strings.Index(trimmed, `{"tool_calls"`); i > 0 {
-		// prose before the tool JSON: start the candidate at the payload
-		candidates = append(candidates, strings.TrimSpace(trimmed[i:]))
-	}
-	if strings.Contains(trimmed, "```json") {
-		for _, part := range strings.Split(trimmed, "```json")[1:] {
-			code := strings.TrimSpace(firstBlock(part))
-			if strings.HasPrefix(code, "{") {
-				candidates = append(candidates, code)
-			}
-		}
-	} else if strings.Contains(trimmed, "```") {
-		for _, part := range strings.Split(trimmed, "```")[1:] {
-			code := strings.TrimSpace(firstBlock(part))
-			if strings.HasPrefix(code, "{") {
-				candidates = append(candidates, code)
-			}
-		}
-	}
+	return TryParseToolCallsWith(text, ParseOptions{})
+}
 
-	for _, cand := range candidates {
-		var payload struct {
-			ToolCalls []struct {
-				ID       string          `json:"id"`
-				Type     string          `json:"type"`
-				Function json.RawMessage `json:"function"`
-			} `json:"tool_calls"`
-		}
-		if !decodeToolPayload(cand, &payload) {
+// TryParseToolCallsForTools is TryParseToolCalls with the offered tool names
+// used to validate the looser repairs (bare object / spilled parameters).
+func TryParseToolCallsForTools(text string, tools []ToolDef) (string, []ToolCall, bool) {
+	return TryParseToolCallsWith(text, optionsForTools(tools))
+}
+
+// TryParseToolCallsWith is TryParseToolCalls with explicit options.
+func TryParseToolCallsWith(text string, opts ParseOptions) (string, []ToolCall, bool) {
+	if remaining, calls, ok := parseJSONToolCalls(text, opts); ok {
+		return remaining, calls, true
+	}
+	return parseTaggedToolCalls(text, opts)
+}
+
+// ---------------------------------------------------------------------------
+// JSON payload path
+// ---------------------------------------------------------------------------
+
+func parseJSONToolCalls(text string, opts ParseOptions) (string, []ToolCall, bool) {
+	for _, cand := range jsonCandidates(text) {
+		var v any
+		if !decodeJSONValue(cand, &v) {
 			continue
 		}
-		// A prose-prefix candidate runs to the end of the text; keep only
-		// the payload itself so prose after the JSON survives in remaining.
+		calls := callsFromValue(v, opts, "")
+		if len(calls) == 0 {
+			continue
+		}
+		// A prose-prefix candidate runs to the end of the text; keep only the
+		// payload itself so prose after the JSON survives in remaining.
 		if full, ok := jsonPrefix(cand); ok && len(full) < len(cand) {
 			cand = full
-		}
-		if payload.ToolCalls == nil {
-			continue
-		}
-		calls := make([]ToolCall, 0, len(payload.ToolCalls))
-		bad := false
-		for i, tc := range payload.ToolCalls {
-			var fn struct {
-				Name      string          `json:"name"`
-				Arguments json.RawMessage `json:"arguments"`
-			}
-			// function 字段缺失或解析不出名字的条目是坏数据：标记 bad 让整
-			// 个候选被丢弃，而不是把一个 name 为空的 tool call 交给客户端
-			// （错误被吞掉后要到执行阶段才暴露）。
-			if err := json.Unmarshal(tc.Function, &fn); err != nil || fn.Name == "" {
-				bad = true
-				break
-			}
-			args := "{}"
-			if len(fn.Arguments) > 0 {
-				var s string
-				if err := json.Unmarshal(fn.Arguments, &s); err == nil {
-					// Continuation stitching may have introduced raw control
-					// characters into the inner JSON; heal them and close any
-					// trailing string/brace the model forgot before the
-					// channel cap let it stop.
-					s = EscapeControlChars(s)
-					args = balanceJSON(s)
-					if !json.Valid([]byte(args)) {
-						// The model's close sequence may be one brace or
-						// quote short, leaving stray closers after the inner
-						// object: keep the first complete JSON value and
-						// drop the dangling tail.
-						if prefix, ok := jsonPrefix(s); ok {
-							args = prefix
-						}
-					}
-					if !json.Valid([]byte(args)) {
-						// Last resort: the reply leaked a raw quote or got
-						// cut mid-escape — re-anchor on the final string
-						// literal and rebuild so the client still receives
-						// a tool call with whatever content survived.
-						if closed, ok := forceCloseJSON(s); ok {
-							args = closed
-						}
-					}
-					if !json.Valid([]byte(args)) {
-						bad = true
-						break
-					}
-				} else {
-					// arguments already delivered as an object
-					var obj any
-					if json.Unmarshal(fn.Arguments, &obj) == nil {
-						raw, _ := json.Marshal(obj)
-						args = string(raw)
-					}
-				}
-			}
-			id := tc.ID
-			if id == "" {
-				id = "call_" + randomHex(8)
-			}
-			typ := tc.Type
-			if typ == "" {
-				typ = "function"
-			}
-			_ = i
-			calls = append(calls, ToolCall{
-				ID:   id,
-				Type: typ,
-				Function: FunctionCall{
-					Name:      fn.Name,
-					Arguments: args,
-				},
-			})
-		}
-		if bad {
-			continue
 		}
 		remaining := strings.ReplaceAll(text, cand, "")
 		remaining = strings.ReplaceAll(remaining, "```json", "")
@@ -140,29 +94,819 @@ func TryParseToolCalls(text string) (string, []ToolCall, bool) {
 	return text, nil, false
 }
 
-// decodeToolPayload unmarshals cand, falling back to suffix balancing (the
-// model broke out mid-string) and to the first complete JSON value (stray
-// closers after a complete object).
-func decodeToolPayload(cand string, payload any) bool {
-	if err := json.Unmarshal([]byte(cand), payload); err == nil {
+// jsonCandidates collects the substrings that could hold a tool-call payload:
+// the trimmed text itself, the suffix after a prose prefix, and fenced blocks.
+func jsonCandidates(text string) []string {
+	trimmed := strings.TrimSpace(text)
+	var out []string
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		out = append(out, trimmed)
+	} else if i := strings.Index(trimmed, `{"tool_calls"`); i > 0 {
+		out = append(out, strings.TrimSpace(trimmed[i:]))
+	} else if i := firstJSONStart(trimmed); i > 0 {
+		out = append(out, strings.TrimSpace(trimmed[i:]))
+	}
+	if strings.Contains(trimmed, "```json") {
+		for _, part := range strings.Split(trimmed, "```json")[1:] {
+			out = appendCandidate(out, part)
+		}
+	} else if strings.Contains(trimmed, "```") {
+		for _, part := range strings.Split(trimmed, "```")[1:] {
+			out = appendCandidate(out, part)
+		}
+	}
+	return out
+}
+
+func appendCandidate(out []string, part string) []string {
+	code := strings.TrimSpace(firstBlock(part))
+	if strings.HasPrefix(code, "{") || strings.HasPrefix(code, "[") {
+		return append(out, code)
+	}
+	return out
+}
+
+func firstJSONStart(s string) int { return strings.IndexAny(s, "{[") }
+
+func lastJSONEnd(s string) int {
+	i := strings.LastIndexByte(s, '}')
+	if j := strings.LastIndexByte(s, ']'); j > i {
+		i = j
+	}
+	return i
+}
+
+// decodeJSONValue unmarshals raw, falling back through the repair ladder:
+// unquoted keys / invalid backslashes, suffix balancing, the first complete
+// JSON value, then the force-close rebuild.
+func decodeJSONValue(raw string, out *any) bool {
+	try := func(s string) bool {
+		if s == "" {
+			return false
+		}
+		var v any
+		if err := json.Unmarshal([]byte(s), &v); err == nil {
+			*out = v
+			return true
+		}
+		return false
+	}
+	if try(raw) {
 		return true
 	}
-	if balanced := balanceJSON(cand); balanced != cand {
-		if err := json.Unmarshal([]byte(balanced), payload); err == nil {
-			return true
+	if fixed, ok := repairJSON(raw); ok && try(fixed) {
+		return true
+	}
+	// The candidate may carry prose or tag debris around the payload: retry
+	// the repairs on the bracketed JSON extent only.
+	if i := firstJSONStart(raw); i >= 0 {
+		if j := lastJSONEnd(raw); j > i {
+			sub := raw[i : j+1]
+			if fixed, ok := repairJSON(sub); ok && try(fixed) {
+				return true
+			}
+			if balanced := balanceJSON(sub); balanced != sub && try(balanced) {
+				return true
+			}
 		}
 	}
-	if prefix, ok := jsonPrefix(cand); ok {
-		if err := json.Unmarshal([]byte(prefix), payload); err == nil {
-			return true
-		}
+	if balanced := balanceJSON(raw); balanced != raw && try(balanced) {
+		return true
 	}
-	if closed, ok := forceCloseJSON(cand); ok {
-		if err := json.Unmarshal([]byte(closed), payload); err == nil {
+	if prefix, ok := jsonPrefix(raw); ok && try(prefix) {
+		return true
+	}
+	if closed, ok := forceCloseJSON(raw); ok && try(closed) {
+		return true
+	}
+	return false
+}
+
+// callsFromValue maps a decoded JSON value onto tool calls. A {"tool_calls":
+// …} shell, a bare array or a bare object are all accepted.
+func callsFromValue(v any, opts ParseOptions, fallbackName string) []ToolCall {
+	switch t := v.(type) {
+	case map[string]any:
+		if shell, ok := t["tool_calls"]; ok {
+			return callsFromCollection(shell, opts, fallbackName)
+		}
+		return normalizeAndMap([]any{t}, opts, fallbackName)
+	case []any:
+		return normalizeAndMap(t, opts, fallbackName)
+	}
+	return nil
+}
+
+func callsFromCollection(v any, opts ParseOptions, fallbackName string) []ToolCall {
+	switch t := v.(type) {
+	case []any:
+		if len(t) == 0 {
+			return nil
+		}
+		return normalizeAndMap(t, opts, fallbackName)
+	case map[string]any:
+		return normalizeAndMap([]any{t}, opts, fallbackName)
+	}
+	return nil
+}
+
+// normalizeAndMap requires every item to map onto a valid call: a single bad
+// entry rejects the whole collection (a name-less call must never reach the
+// client, where it only fails at execution time).
+func normalizeAndMap(items []any, opts ParseOptions, fallbackName string) []ToolCall {
+	calls := make([]ToolCall, 0, len(items))
+	for _, it := range items {
+		if m, ok := it.(map[string]any); ok && fallbackName != "" && !hasNameish(m) {
+			m["name"] = fallbackName
+		}
+		c, ok := callFromItem(it, opts)
+		if !ok {
+			return nil
+		}
+		calls = append(calls, c)
+	}
+	return calls
+}
+
+func hasNameish(m map[string]any) bool {
+	if _, ok := m["function"]; ok {
+		return true
+	}
+	for _, k := range nameKeys {
+		if _, ok := m[k]; ok {
 			return true
 		}
 	}
 	return false
+}
+
+var (
+	nameKeys = []string{"name", "tool", "tool_name", "function_name", "fn"}
+	argKeys  = []string{"arguments", "params", "parameters", "args", "input", "function_input"}
+	metaKeys = map[string]bool{
+		"id": true, "type": true, "index": true, "function": true,
+		"name": true, "tool": true, "tool_name": true, "function_name": true, "fn": true,
+		"arguments": true, "params": true, "parameters": true, "args": true,
+		"input": true, "function_input": true, "call_id": true,
+	}
+)
+
+// callFromItem maps one tool-call object onto a ToolCall, applying the field
+// alias, name/arguments swap and spilled-parameter repairs.
+func callFromItem(item any, opts ParseOptions) (ToolCall, bool) {
+	obj, ok := item.(map[string]any)
+	if !ok {
+		return ToolCall{}, false
+	}
+	name, args, ok := extractNameArgs(obj, opts)
+	if !ok || name == "" {
+		return ToolCall{}, false
+	}
+	argText, ok := encodeArguments(args)
+	if !ok {
+		return ToolCall{}, false
+	}
+	id := stringValue(obj["id"])
+	if id == "" {
+		id = "call_" + randomHex(8)
+	}
+	typ := stringValue(obj["type"])
+	if typ == "" {
+		typ = "function"
+	}
+	return ToolCall{
+		ID:       id,
+		Type:     typ,
+		Function: FunctionCall{Name: name, Arguments: argText},
+	}, true
+}
+
+func extractNameArgs(obj map[string]any, opts ParseOptions) (string, any, bool) {
+	// Nested function object: {"function":{"name":…,"arguments":…}}.
+	if fn, ok := obj["function"].(map[string]any); ok {
+		name := firstString(fn, "name")
+		if name == "" {
+			name = firstString(obj, nameKeys...)
+		}
+		if name == "" {
+			return "", nil, false
+		}
+		if args, ok := lookupArg(fn); ok {
+			return name, args, true
+		}
+		if args, ok := lookupArg(obj); ok {
+			return name, args, true
+		}
+		if spilled := spilledArgs(obj); len(spilled) > 0 {
+			return name, spilled, true
+		}
+		return name, map[string]any{}, true
+	}
+	// function as a plain string alias: {"function":"get_weather","params":{…}}.
+	if fn, ok := obj["function"].(string); ok && fn != "" {
+		if args, ok := lookupArg(obj); ok {
+			return fn, args, true
+		}
+		return fn, spilledArgs(obj), true
+	}
+	// Swapped: name holds the parameter object, arguments holds the name.
+	if nameObj, ok := obj["name"].(map[string]any); ok {
+		if s, ok := obj["arguments"].(string); ok && s != "" {
+			return s, nameObj, true
+		}
+	}
+	name := firstString(obj, nameKeys...)
+	if name == "" {
+		return "", nil, false
+	}
+	if args, ok := lookupArg(obj); ok {
+		return name, args, true
+	}
+	// Parameters spilled to the top level: every non-meta key is an argument.
+	if spilled := spilledArgs(obj); len(spilled) > 0 {
+		if len(opts.ToolNames) == 0 || containsString(opts.ToolNames, name) {
+			return name, spilled, true
+		}
+		// The offered tool list is known and the name is not one of them:
+		// this is ordinary JSON, not a tool call.
+		return "", nil, false
+	}
+	return name, map[string]any{}, true
+}
+
+func lookupArg(obj map[string]any) (any, bool) {
+	for _, k := range argKeys {
+		if v, ok := obj[k]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+func spilledArgs(obj map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range obj {
+		if metaKeys[k] {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// encodeArguments renders the arguments value: a string is healed into valid
+// JSON, anything else is marshalled as-is.
+func encodeArguments(v any) (string, bool) {
+	switch t := v.(type) {
+	case nil:
+		return "{}", true
+	case string:
+		return healArgumentString(t)
+	default:
+		raw, err := json.Marshal(t)
+		if err != nil {
+			return "", false
+		}
+		return string(raw), true
+	}
+}
+
+func healArgumentString(s string) (string, bool) {
+	s = EscapeControlChars(s)
+	if json.Valid([]byte(s)) {
+		return s, true
+	}
+	if fixed, ok := repairJSON(s); ok {
+		return fixed, true
+	}
+	if balanced := balanceJSON(s); json.Valid([]byte(balanced)) {
+		return balanced, true
+	}
+	if prefix, ok := jsonPrefix(s); ok {
+		return prefix, true
+	}
+	if closed, ok := forceCloseJSON(s); ok {
+		return closed, true
+	}
+	return "", false
+}
+
+func firstString(obj map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s, ok := obj[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func stringValue(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Tagged / XML path
+// ---------------------------------------------------------------------------
+
+func parseTaggedToolCalls(text string, opts ParseOptions) (string, []ToolCall, bool) {
+	var calls []ToolCall
+	var remaining strings.Builder
+	pos, last := 0, 0
+	for pos < len(text) {
+		start, startLen, startTag, ok := findStartTag(text[pos:], opts)
+		if !ok {
+			break
+		}
+		abs := pos + start
+		if isInsideCodeFence(text, abs) {
+			break
+		}
+		after := abs + startLen
+		innerEnd, end := len(text), len(text)
+		if p, l, found := findEndTag(text, after, opts, startTag); found && p >= after {
+			innerEnd, end = p, p+l
+		}
+		got := extractTaggedCalls(text[after:innerEnd], opts)
+		if len(got) > 0 {
+			remaining.WriteString(text[last:abs])
+			calls = append(calls, got...)
+			last, pos = end, end
+			continue
+		}
+		pos = after
+		if pos <= abs {
+			pos = abs + 1
+		}
+	}
+	if len(calls) == 0 {
+		return text, nil, false
+	}
+	remaining.WriteString(text[last:])
+	return strings.TrimSpace(remaining.String()), calls, true
+}
+
+// extractTaggedCalls parses the body between a tag pair: a wrapped JSON array
+// or object first, then the XML dialects.
+func extractTaggedCalls(inner string, opts ParseOptions) []ToolCall {
+	fallbackName := extractXMLName(inner)
+	if calls := parseJSONInText(inner, opts, fallbackName); len(calls) > 0 {
+		return calls
+	}
+	if calls := parseXMLInvokeCalls(inner, opts); len(calls) > 0 {
+		return calls
+	}
+	return parseXMLFunctionCalls(inner, opts)
+}
+
+// parseJSONInText pulls the first JSON array/object out of inner and maps it,
+// injecting fallbackName into items that carry arguments but no name (the
+// mixed <tool_calls><function><name>…</name></function>[{"arguments":…}]
+// shape).
+func parseJSONInText(inner string, opts ParseOptions, fallbackName string) []ToolCall {
+	if i := strings.IndexByte(inner, '['); i >= 0 {
+		if j := strings.LastIndexByte(inner, ']'); j > i {
+			raw := inner[i : j+1]
+			var v any
+			if decodeJSONValue(raw, &v) {
+				return callsFromCollection(v, opts, fallbackName)
+			}
+		}
+	}
+	if i := strings.IndexByte(inner, '{'); i >= 0 {
+		if j := strings.LastIndexByte(inner, '}'); j > i {
+			raw := inner[i : j+1]
+			var v any
+			if decodeJSONValue(raw, &v) {
+				return callsFromValue(v, opts, fallbackName)
+			}
+		}
+	}
+	return nil
+}
+
+func parseXMLInvokeCalls(inner string, opts ParseOptions) []ToolCall {
+	var calls []ToolCall
+	lower := strings.ToLower(inner)
+	pos := 0
+	for {
+		i := strings.Index(lower[pos:], "<invoke")
+		if i < 0 {
+			return calls
+		}
+		abs := pos + i
+		gt := strings.IndexByte(inner[abs:], '>')
+		if gt < 0 {
+			return calls
+		}
+		head := inner[abs : abs+gt+1]
+		bodyStart := abs + gt + 1
+		ci := strings.Index(lower[bodyStart:], "</invoke>")
+		if ci < 0 {
+			return calls
+		}
+		body := inner[abs : bodyStart+ci]
+		name := xmlAttr(head, "name")
+		if name == "" {
+			name = xmlTagValue(body, "name")
+		}
+		if name != "" {
+			calls = append(calls, makeXMLCall(name, parseXMLParams(body)))
+		}
+		pos = bodyStart + ci + len("</invoke>")
+	}
+}
+
+func parseXMLFunctionCalls(inner string, opts ParseOptions) []ToolCall {
+	var calls []ToolCall
+	lower := strings.ToLower(inner)
+	pos := 0
+	for {
+		i := strings.Index(lower[pos:], "<function")
+		if i < 0 {
+			return calls
+		}
+		abs := pos + i
+		gt := strings.IndexByte(inner[abs:], '>')
+		if gt < 0 {
+			return calls
+		}
+		head := inner[abs : abs+gt+1]
+		selfClose := strings.HasSuffix(strings.TrimSpace(head), "/>")
+		bodyStart := abs + gt + 1
+		bodyEnd, next := len(inner), len(inner)
+		if !selfClose {
+			if ci := strings.Index(lower[bodyStart:], "</function>"); ci >= 0 {
+				bodyEnd = bodyStart + ci
+				next = bodyEnd + len("</function>")
+			}
+		}
+		body := inner[bodyStart:bodyEnd]
+		name := xmlAttr(head, "name")
+		if name == "" {
+			name = xmlTagValue(body, "name")
+		}
+		if name != "" {
+			calls = append(calls, makeXMLCall(name, parseXMLParams(body)))
+		}
+		if next >= len(inner) {
+			return calls
+		}
+		pos = next
+	}
+}
+
+func makeXMLCall(name string, params map[string]any) ToolCall {
+	raw, err := json.Marshal(params)
+	if err != nil || len(raw) == 0 {
+		raw = []byte("{}")
+	}
+	return ToolCall{
+		ID:       "call_" + randomHex(8),
+		Type:     "function",
+		Function: FunctionCall{Name: name, Arguments: string(raw)},
+	}
+}
+
+// parseXMLParams collects <parameter name="k">v</parameter> / <param name="k">
+// values, falling back to the JSON inside <arguments>.
+func parseXMLParams(body string) map[string]any {
+	params := map[string]any{}
+	lower := strings.ToLower(body)
+	for _, tag := range []string{"parameter", "param"} {
+		open := "<" + tag
+		closeTag := "</" + tag + ">"
+		pos := 0
+		for {
+			i := strings.Index(lower[pos:], open)
+			if i < 0 {
+				break
+			}
+			abs := pos + i
+			gt := strings.IndexByte(body[abs:], '>')
+			if gt < 0 {
+				break
+			}
+			head := body[abs : abs+gt+1]
+			bodyStart := abs + gt + 1
+			if strings.HasSuffix(strings.TrimSpace(head), "/>") {
+				pos = bodyStart
+				continue
+			}
+			name := xmlAttr(head, "name")
+			ci := strings.Index(lower[bodyStart:], closeTag)
+			if ci < 0 {
+				break
+			}
+			if name != "" {
+				params[name] = coerceXMLValue(body[bodyStart : bodyStart+ci])
+			}
+			pos = bodyStart + ci + len(closeTag)
+		}
+	}
+	if len(params) == 0 {
+		if args := xmlTagValue(body, "arguments"); args != "" {
+			var v any
+			if decodeJSONValue(strings.TrimSpace(args), &v) {
+				if m, ok := v.(map[string]any); ok {
+					return m
+				}
+			}
+		}
+	}
+	return params
+}
+
+func coerceXMLValue(s string) any {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return ""
+	}
+	var v any
+	if json.Unmarshal([]byte(t), &v) == nil {
+		return v
+	}
+	return s
+}
+
+func extractXMLName(s string) string {
+	if v := xmlTagValue(s, "name"); v != "" {
+		return v
+	}
+	if i := strings.Index(strings.ToLower(s), "<function"); i >= 0 {
+		if v := xmlAttr(s[i:], "name"); v != "" {
+			return v
+		}
+	}
+	if i := strings.Index(strings.ToLower(s), "<invoke"); i >= 0 {
+		if v := xmlAttr(s[i:], "name"); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// xmlTagValue returns the trimmed body of the first <tag>…</tag> pair.
+func xmlTagValue(s, tag string) string {
+	lower := strings.ToLower(s)
+	open := "<" + strings.ToLower(tag)
+	i := strings.Index(lower, open)
+	if i < 0 {
+		return ""
+	}
+	gt := strings.IndexByte(s[i:], '>')
+	if gt < 0 {
+		return ""
+	}
+	bodyStart := i + gt + 1
+	closeTag := "</" + strings.ToLower(tag) + ">"
+	ci := strings.Index(lower[bodyStart:], closeTag)
+	if ci < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[bodyStart : bodyStart+ci])
+}
+
+// xmlAttr returns the value of attr="…" / attr='…' inside the first tag of s.
+func xmlAttr(s, attr string) string {
+	lower := strings.ToLower(s)
+	key := strings.ToLower(attr)
+	i := strings.Index(lower, key)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(attr):]
+	rest = strings.TrimLeft(rest, " \t\r\n")
+	if rest == "" || rest[0] != '=' {
+		return ""
+	}
+	rest = strings.TrimLeft(rest[1:], " \t\r\n")
+	if rest == "" {
+		return ""
+	}
+	quote := rest[0]
+	if quote != '"' && quote != '\'' {
+		return ""
+	}
+	end := strings.IndexByte(rest[1:], quote)
+	if end < 0 {
+		return ""
+	}
+	return rest[1 : 1+end]
+}
+
+func findStartTag(text string, opts ParseOptions) (int, int, string, bool) {
+	for _, tag := range builtinStartTags {
+		if p, l, ok := findTagFuzzy(text, tag); ok {
+			return p, l, tag, true
+		}
+	}
+	for _, tag := range opts.ExtraStarts {
+		if strings.TrimSpace(tag) == "" {
+			continue
+		}
+		if p, l, ok := findTagFuzzy(text, tag); ok {
+			return p, l, tag, true
+		}
+	}
+	return 0, 0, "", false
+}
+
+func findEndTag(s string, from int, opts ParseOptions, startTag string) (int, int, bool) {
+	if from > len(s) {
+		from = len(s)
+	}
+	search := s[from:]
+	if open := strings.TrimRight(startTag, ">"); strings.HasPrefix(open, "<") && !strings.HasPrefix(open, "</") {
+		if p, l, ok := findTagFuzzy(search, "</"+open[1:]+">"); ok {
+			return from + p, l, true
+		}
+	}
+	for _, tag := range builtinEndTags {
+		if p, l, ok := findTagFuzzy(search, tag); ok {
+			return from + p, l, true
+		}
+	}
+	for _, tag := range opts.ExtraEnds {
+		if strings.TrimSpace(tag) == "" {
+			continue
+		}
+		if p, l, ok := findTagFuzzy(search, tag); ok {
+			return from + p, l, true
+		}
+	}
+	// A following start tag also terminates the block when the model forgot
+	// the end marker between two calls.
+	if p, l, ok := findTagFuzzy(search, startTag); ok {
+		return from + p, l, true
+	}
+	for _, tag := range builtinStartTags {
+		if p, l, ok := findTagFuzzy(search, tag); ok {
+			return from + p, l, true
+		}
+	}
+	return 0, 0, false
+}
+
+// findTagFuzzy locates tag (with or without the trailing '>') in s, first by
+// exact match then by the fullwidth/underscore-normalized fuzzy match.
+func findTagFuzzy(s, tag string) (int, int, bool) {
+	partial := strings.TrimRight(tag, ">")
+	if partial == "" {
+		return 0, 0, false
+	}
+	if i := strings.Index(s, partial); i >= 0 {
+		l := len(partial)
+		if i+l < len(s) && s[i+l] == '>' {
+			l++
+		}
+		return i, l, true
+	}
+	if p, l, ok := fuzzyMatchTag(s, partial); ok {
+		if p+l < len(s) && s[p+l] == '>' {
+			l++
+		}
+		return p, l, true
+	}
+	return 0, 0, false
+}
+
+// normTagChar normalizes the lookalike separators: '｜'(U+FF5C) → '|',
+// '▁'(U+2581) → '_'.
+func normTagChar(r rune) rune {
+	switch r {
+	case '\uFF5C':
+		return '|'
+	case '\u2581':
+		return '_'
+	}
+	return r
+}
+
+func eqTagChar(a, b rune) bool {
+	return a == b || normTagChar(a) == normTagChar(b)
+}
+
+func fuzzyMatchTag(haystack, partial string) (int, int, bool) {
+	n := []rune(partial)
+	h := []rune(haystack)
+	if len(n) == 0 || len(h) < len(n) {
+		return 0, 0, false
+	}
+	for start := 0; start+len(n) <= len(h); start++ {
+		matched := true
+		for j := 0; j < len(n); j++ {
+			if !eqTagChar(n[j], h[start+j]) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			bpos, blen := 0, 0
+			for _, r := range h[:start] {
+				bpos += utf8.RuneLen(r)
+			}
+			for _, r := range h[start : start+len(n)] {
+				blen += utf8.RuneLen(r)
+			}
+			return bpos, blen, true
+		}
+	}
+	return 0, 0, false
+}
+
+func isInsideCodeFence(s string, pos int) bool {
+	if pos < 0 {
+		return false
+	}
+	if pos > len(s) {
+		pos = len(s)
+	}
+	return strings.Count(s[:pos], "```")%2 == 1
+}
+
+// repairJSON applies the two reference repairs — invalid backslashes then
+// unquoted keys — and reports whether the result is valid JSON.
+func repairJSON(s string) (string, bool) {
+	step1 := repairInvalidBackslashes(s)
+	if json.Valid([]byte(step1)) {
+		return step1, true
+	}
+	step2 := repairUnquotedKeys(step1)
+	if json.Valid([]byte(step2)) {
+		return step2, true
+	}
+	return "", false
+}
+
+func repairInvalidBackslashes(s string) string {
+	runes := []rune(s)
+	var out strings.Builder
+	out.Grow(len(s))
+	for i := 0; i < len(runes); i++ {
+		c := runes[i]
+		if c != '\\' {
+			out.WriteRune(c)
+			continue
+		}
+		if i+1 < len(runes) {
+			n := runes[i+1]
+			if strings.ContainsRune(`"\/bfnrtu`, n) {
+				out.WriteRune('\\')
+				out.WriteRune(n)
+			} else {
+				out.WriteString(`\\`)
+				out.WriteRune(n)
+			}
+			i++
+			continue
+		}
+		out.WriteRune('\\')
+	}
+	return out.String()
+}
+
+func repairUnquotedKeys(s string) string {
+	runes := []rune(s)
+	var out strings.Builder
+	out.Grow(len(s) + 32)
+	i := 0
+	for i < len(runes) {
+		out.WriteRune(runes[i])
+		if (runes[i] == '{' || runes[i] == ',') && i+1 < len(runes) {
+			i++
+			for i < len(runes) && unicode.IsSpace(runes[i]) {
+				out.WriteRune(runes[i])
+				i++
+			}
+			if i < len(runes) && (unicode.IsLetter(runes[i]) || runes[i] == '_') {
+				keyStart := i
+				for i < len(runes) && (unicode.IsLetter(runes[i]) || unicode.IsDigit(runes[i]) || runes[i] == '_') {
+					i++
+				}
+				if i < len(runes) && runes[i] == ':' {
+					out.WriteRune('"')
+					out.WriteString(string(runes[keyStart:i]))
+					out.WriteRune('"')
+				} else {
+					out.WriteString(string(runes[keyStart:i]))
+					continue
+				}
+			}
+			continue
+		}
+		i++
+	}
+	return out.String()
 }
 
 // jsonPrefix returns the first complete JSON value in s, ignoring any
@@ -270,7 +1014,9 @@ func balanceJSON(s string) string {
 func randomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		return "00000000"[:n]
+		// n*2 hex chars, same length as the happy path — and unlike
+		// "00000000"[:n] this cannot slice past the end for n > 8.
+		return strings.Repeat("0", n*2)
 	}
 	const hexdigits = "0123456789abcdef"
 	out := make([]byte, n*2)

@@ -39,7 +39,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.RLock()
-	m, ok := s.cfg.Models[req.Model]
+	m, resolvedID, ok := s.cfg.ResolveModel(req.Model)
 	site := ""
 	enabled := false
 	if ok {
@@ -51,6 +51,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "model not found: "+req.Model, "invalid_request_error")
 		return
 	}
+	if resolvedID != req.Model {
+		s.log.Info("model aliased", "requested", req.Model, "resolved", resolvedID)
+		req.Model = resolvedID
+	}
+	// 客户端回放的 tool_call_id 必须非空（上游对空 id 直接 400 拒绝整个
+	// 请求）：缺失的按前序 assistant tool_calls 配对回填，配不上就合成
+	// 占位 id —— 不拒绝请求，修复永远发生在 BuildPrompt 之前。
+	openai.BackfillToolIDs(req.Messages)
 
 	maxTokens := req.MaxTokens
 	if maxTokens == nil {
@@ -159,7 +167,7 @@ func buildCompletion(req openai.ChatCompletionRequest, prompt, body string) *ope
 	// Role 的 json tag 没有 omitempty，漏设会返回空串；与流式路径保持一致。
 	message := openai.ChoiceMessage{Role: "assistant", Content: body}
 	if len(req.Tools) > 0 {
-		remaining, calls, ok := openai.TryParseToolCalls(body)
+		remaining, calls, ok := openai.TryParseToolCallsForTools(body, req.Tools)
 		if ok {
 			message.Content = remaining
 			message.ToolCalls = calls
@@ -312,7 +320,7 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
 	var resend []openai.ToolCall
 	if args == nil {
 		// plain reply: content streamed live, final chunk carries no content
-	} else if remaining, calls, ok := openai.TryParseToolCalls(body); ok {
+	} else if remaining, calls, ok := openai.TryParseToolCallsForTools(body, req.Tools); ok {
 		content = remaining
 		stop = "tool_calls"
 		deltas, miss, diverged := args.Finalize(calls)

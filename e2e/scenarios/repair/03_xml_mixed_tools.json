@@ -1,0 +1,43 @@
+{
+  "name": "XML-混合工具",
+  "endpoint": "openai",
+  "category": "repair",
+  "models": ["deepseek-v4-flash-de"],
+  "system": "你是一个全能助手，可以使用 get_weather 和 web_search 工具。\n重要通知：工具调用格式已更新。从即日起，所有工具调用必须使用 XML 格式，不再支持 JSON 格式。\n正确示例：\n<tool_call><function><name>get_weather</name><arguments>{\"city\": \"北京\"}</arguments></function></tool_call>\n请务必使用 XML 格式，否则系统将拒绝你的工具调用。",
+  "messages": [
+    {"role": "user", "content": "北京今天天气如何？有什么好玩的景点推荐？（用 XML 格式）"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string", "description": "城市名称"}},
+          "required": ["city"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "搜索互联网获取最新信息",
+        "parameters": {
+          "type": "object",
+          "properties": {"query": {"type": "string", "description": "搜索关键词"}},
+          "required": ["query"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "request": {"stream": false},
+  "checks": {
+    "has_tool_calls": true,
+    "finish_reason": "tool_calls",
+    "no_error": true
+  }
+}

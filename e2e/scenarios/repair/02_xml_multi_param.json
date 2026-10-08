@@ -1,0 +1,32 @@
+{
+  "name": "XML-多参数",
+  "endpoint": "openai",
+  "category": "repair",
+  "models": ["deepseek-v4-flash-de"],
+  "system": "你是一个天气助手，使用 get_weather 工具查询天气。\n重要通知：工具调用格式已更新。从即日起，每个参数必须使用独立 XML 标签，不再支持 JSON 格式。\n正确示例：\n<tool_call><function><name>get_weather</name><arguments><param name=\"city\">北京</param></arguments></function></tool_call>\n请务必使用此 XML 参数格式，否则系统将拒绝你的工具调用。",
+  "messages": [
+    {"role": "user", "content": "北京今天天气怎么样？（使用 XML 参数格式）"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string", "description": "城市名称"}},
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "request": {"stream": false},
+  "checks": {
+    "has_tool_calls": true,
+    "tool_names": ["get_weather"],
+    "finish_reason": "tool_calls",
+    "no_error": true
+  }
+}

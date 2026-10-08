@@ -82,6 +82,7 @@ func ToOpenAI(req *Request) ([]openai.ChatMessage, []openai.ToolDef, json.RawMes
 	if req.ToolChoice != nil {
 		tc = toolChoiceToOpenAI(req.ToolChoice)
 	}
+	openai.BackfillToolIDs(out)
 	return out, tools, tc, nil
 }
 

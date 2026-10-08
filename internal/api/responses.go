@@ -47,10 +47,27 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req, writeError) {
 		return
 	}
+
+	inputText := responsesInputText(&req)
+	var history []openai.ChatMessage
+	if prev := strings.TrimSpace(req.PreviousResponseID); prev != "" {
+		turn, ok := s.rstore.get(prev)
+		if !ok {
+			writeError(w, http.StatusBadRequest,
+				"previous_response_id '"+prev+"' not found or expired; resend the full input",
+				"invalid_request_error")
+			return
+		}
+		history = openai.HistoryMessages(turn)
+	}
+
 	messages, err := openai.ResponsesToMessages(&req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
+	}
+	if len(history) > 0 {
+		messages = spliceHistory(messages, history)
 	}
 	tools := make([]openai.ToolDef, 0, len(req.Tools))
 	for _, t := range req.Tools {
@@ -59,7 +76,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.cfg.RLock()
-	m, ok := s.cfg.Models[req.Model]
+	m, resolvedID, ok := s.cfg.ResolveModel(req.Model)
 	site := ""
 	enabled := false
 	if ok {
@@ -70,6 +87,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "model not found: "+req.Model, "invalid_request_error")
 		return
 	}
+	if resolvedID != req.Model {
+		s.log.Info("model aliased", "requested", req.Model, "resolved", resolvedID)
+		req.Model = resolvedID
+	}
 
 	prompt := openai.BuildPrompt(messages, responsesPromptOptions(&req, tools))
 
@@ -79,8 +100,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.upstreamCtx(r)
 	defer cancel()
 
+	shouldStore := req.Store == nil || *req.Store
+
 	if req.Stream {
-		s.streamResponses(ctx, w, req, prompt, site, tools, continuationFor(tools, messages, s.continueRounds()))
+		s.streamResponses(ctx, w, req, prompt, site, tools, continuationFor(tools, messages, s.continueRounds()), inputText, shouldStore)
 		return
 	}
 
@@ -99,8 +122,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if len(calls) > 0 {
 		stopReason = "tool_use"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":          "resp_" + randHex(16),
+	respID := "resp_" + randHex(16)
+	resp := map[string]any{
+		"id":          respID,
 		"object":      "response",
 		"created_at":  time.Now().Unix(),
 		"status":      "completed",
@@ -109,7 +133,83 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"output_text": text,
 		"stop_reason": stopReason,
 		"usage":       responsesUsage(out.usage),
-	})
+	}
+	if shouldStore {
+		s.rstore.insert(respID, openai.StoredTurn{InputText: inputText, Output: output, Response: resp})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// spliceHistory inserts the replayed history right after a leading
+// system/developer message so instructions keep their place at the top.
+func spliceHistory(messages, history []openai.ChatMessage) []openai.ChatMessage {
+	if len(messages) > 0 && (messages[0].Role == "system" || messages[0].Role == "developer") {
+		merged := make([]openai.ChatMessage, 0, len(messages)+len(history))
+		merged = append(merged, messages[0])
+		merged = append(merged, history...)
+		merged = append(merged, messages[1:]...)
+		return merged
+	}
+	merged := make([]openai.ChatMessage, 0, len(messages)+len(history))
+	merged = append(merged, history...)
+	merged = append(merged, messages...)
+	return merged
+}
+
+// responsesInputText extracts the user input text from a Responses request for
+// the stored turn (a plain string, or the text of the user message items).
+func responsesInputText(req *openai.ResponsesRequest) string {
+	trimmed := strings.TrimSpace(string(req.Input))
+	if trimmed == "" {
+		return ""
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if json.Unmarshal(req.Input, &s) == nil {
+			return s
+		}
+		return ""
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(req.Input, &items) != nil {
+		return ""
+	}
+	var parts []string
+	for _, raw := range items {
+		var probe struct {
+			Type string `json:"type"`
+			Role string `json:"role"`
+		}
+		if json.Unmarshal(raw, &probe) != nil {
+			continue
+		}
+		if (probe.Type != "" && probe.Type != "message") || (probe.Role != "" && probe.Role != "user") {
+			continue
+		}
+		var it struct {
+			Content json.RawMessage `json:"content"`
+		}
+		_ = json.Unmarshal(raw, &it)
+		var content openai.MessageContent
+		if json.Unmarshal(it.Content, &content) == nil {
+			if s := content.String(); s != "" {
+				parts = append(parts, s)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// handleGetResponse serves a stored Response snapshot, or 404 when unknown or
+// expired.
+func (s *Server) handleGetResponse(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	snap, ok := s.rstore.getResponse(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "response not found: "+id, "invalid_request_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
 }
 
 // responseOutputItems renders a plain-text reply plus parsed tool calls as
@@ -142,7 +242,7 @@ func responseOutputItems(text string, calls []openai.ToolCall) []map[string]any 
 	return output
 }
 
-func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req openai.ResponsesRequest, prompt, site string, tools []openai.ToolDef, cont openai.ContinuationFunc) {
+func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req openai.ResponsesRequest, prompt, site string, tools []openai.ToolDef, cont openai.ContinuationFunc, inputText string, shouldStore bool) {
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -469,13 +569,17 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 			output = append(output, item)
 		}
 	}
+	completed := map[string]any{
+		"id": id, "model": req.Model, "status": "completed", "created_at": time.Now().Unix(),
+		"output": output, "stop_reason": stopReason, "usage": responsesUsage(usage),
+	}
 	_ = write(map[string]any{
-		"type": "response.completed",
-		"response": map[string]any{
-			"id": id, "model": req.Model, "status": "completed", "created_at": time.Now().Unix(),
-			"output": output, "stop_reason": stopReason, "usage": responsesUsage(usage),
-		},
+		"type":     "response.completed",
+		"response": completed,
 	})
+	if shouldStore {
+		s.rstore.insert(id, openai.StoredTurn{InputText: inputText, Output: output, Response: completed})
+	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()

@@ -201,3 +201,45 @@ func TestTryParseToolCallsNoToolCall(t *testing.T) {
 		t.Errorf("remaining = %q", remaining)
 	}
 }
+
+// 红测试：function_call_output 缺 call_id 时，转换出的 tool 消息不能带
+// 空 tool_call_id（上游会直接 400 拒绝整条请求）。
+func TestResponsesToMessagesBackfillsEmptyCallID(t *testing.T) {
+	req := &ResponsesRequest{Input: json.RawMessage(`[
+		{"type":"function_call","call_id":"call_1","name":"f","arguments":"{}"},
+		{"type":"function_call_output","output":"ok"}
+	]`)}
+	msgs, err := ResponsesToMessages(req)
+	if err != nil {
+		t.Fatalf("responses_to_messages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("len(msgs) = %d, want 2: %+v", len(msgs), msgs)
+	}
+	if msgs[1].Role != "tool" || msgs[1].ToolCallID != "call_1" {
+		t.Errorf("tool result = %+v, want ToolCallID=call_1", msgs[1])
+	}
+}
+
+// 两侧都缺 id：function_call 现场生成的 id 必须成为 output 的配对目标，
+// 而不是各自随机生成两个对不上的 id。
+func TestResponsesToMessagesBackfillsBothSidesConsistently(t *testing.T) {
+	req := &ResponsesRequest{Input: json.RawMessage(`[
+		{"type":"function_call","name":"f","arguments":"{}"},
+		{"type":"function_call_output","output":"ok"}
+	]`)}
+	msgs, err := ResponsesToMessages(req)
+	if err != nil {
+		t.Fatalf("responses_to_messages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("len(msgs) = %d, want 2: %+v", len(msgs), msgs)
+	}
+	if got := msgs[0].ToolCalls[0].ID; got == "" {
+		t.Fatal("function_call id still empty")
+	}
+	if msgs[1].ToolCallID != msgs[0].ToolCalls[0].ID {
+		t.Errorf("output call_id = %q, want the function_call id %q",
+			msgs[1].ToolCallID, msgs[0].ToolCalls[0].ID)
+	}
+}
