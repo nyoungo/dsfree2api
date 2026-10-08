@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -91,6 +93,11 @@ type Solver struct {
 	// browserMu serializes browser solves: one Chrome window at a time.
 	browserMu sync.Mutex
 
+	// cookie pool: background warm refresh, one slot per site × route.
+	poolMu sync.Mutex
+	poolOn bool
+	warms  map[string]*warmState
+
 	// refreshOverride is a test seam; nil in production.
 	refreshOverride func(ctx context.Context, sess httpx.Session, site *config.Site, c *core) error
 }
@@ -107,7 +114,7 @@ func New(cfg config.Turnstile, userAgent string) *Solver {
 	}
 }
 
-func (s *Solver) Enabled() bool { return s.cfg.Enabled }
+func (s *Solver) Enabled() bool { return s.Config().Enabled }
 
 func (s *Solver) Config() config.Turnstile {
 	s.mu.Lock()
@@ -133,7 +140,7 @@ func (s *Solver) coreFor(proxy string) *core {
 	defer s.mu.Unlock()
 	c, ok := s.cores[key]
 	if !ok {
-		client, _ := httpx.StdClient(proxy, time.Duration(s.cfg.TimeoutSeconds+30)*time.Second)
+		client, _ := httpx.StdClient(proxy, time.Duration(s.cfg.SolveTimeoutValue()+30)*time.Second)
 		c = &core{
 			proxy:  key,
 			client: client,
@@ -287,9 +294,17 @@ func (s *Solver) ApplyValidCookies(ctx context.Context, sess httpx.Session, site
 	return s.refreshLocked(ctx, sess, site, c)
 }
 
+// CookiesReady reports whether an unexpired cached cookie set exists for the
+// site × route pair. Upstream uses it to keep the slow-start timer from
+// killing a first-time Turnstile solve, which can legitimately take minutes.
+func (s *Solver) CookiesReady(siteCode, proxy string) bool {
+	c := s.coreFor(proxy)
+	return c.load(siteCode) != nil
+}
+
 // Refresh forces a fresh solve → verify cycle.
 func (s *Solver) Refresh(ctx context.Context, sess httpx.Session, site *config.Site, proxy string) error {
-	if !s.cfg.Enabled {
+	if !s.Enabled() {
 		return nil
 	}
 	c := s.coreFor(proxy)
@@ -385,32 +400,70 @@ func (s *Solver) solveToken(ctx context.Context, site *config.Site, sitekey stri
 
 func (s *Solver) solveTokenAPI(ctx context.Context, baseURL, sitekey string, c *core) (string, error) {
 	cfg := s.Config()
-	payload, _ := json.Marshal(map[string]any{
-		"url":            baseURL,
-		"sitekey":        sitekey,
-		"action":         cfg.Action,
-		"cdata":          "",
-		"timeoutSeconds": cfg.TimeoutSeconds,
-	})
+	style := cfg.APIStyleValue()
+	var payload []byte
+	if style == "ezsolver" {
+		payload, _ = json.Marshal(map[string]any{
+			"sitekey": sitekey,
+			"siteurl": baseURL,
+			"timeout": cfg.SolveTimeoutValue(),
+		})
+	} else {
+		payload, _ = json.Marshal(map[string]any{
+			"url":            baseURL,
+			"sitekey":        sitekey,
+			"action":         cfg.Action,
+			"cdata":          "",
+			"timeoutSeconds": cfg.SolveTimeoutValue(),
+		})
+	}
 	var last error
+	// A loopback solve service must be reached directly: pushing it through
+	// the route proxy would resolve 127.0.0.1 on the far side of the tunnel.
+	client := c.client
+	if isLocalHost(cfg.APIURL) {
+		client = &http.Client{Timeout: time.Duration(cfg.SolveTimeoutValue()+30) * time.Second}
+	}
 	for attempt := 0; attempt < cfg.Retries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.APIURL, bytes.NewReader(payload))
 		if err != nil {
 			return "", err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
-		resp, err := c.client.Do(req)
+		if cfg.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			last = &Error{Msg: "turnstile solver request failed: " + err.Error(), Retryable: true}
 		} else {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if resp.StatusCode >= 400 {
+				retry := retryableStatus(resp.StatusCode)
+				if style == "ezsolver" {
+					// Local solve services answer 5xx for per-attempt
+					// timeouts; another attempt is reasonable.
+					retry = true
+				}
 				last = &Error{
 					Msg: fmt.Sprintf("turnstile solver http %d: %s (check [turnstile].api_key / api_url)",
 						resp.StatusCode, trim(body)),
-					Retryable: retryableStatus(resp.StatusCode),
+					Retryable: retry,
+				}
+			} else if style == "ezsolver" {
+				var out struct {
+					Token string `json:"token"`
+					Error string `json:"error"`
+				}
+				if err := json.Unmarshal(body, &out); err != nil {
+					last = &Error{Msg: "turnstile solver bad json: " + err.Error()}
+				} else if out.Error != "" {
+					last = &Error{Msg: "turnstile solver error: " + trim([]byte(out.Error))}
+				} else if out.Token == "" {
+					last = &Error{Msg: "turnstile solver returned no token"}
+				} else {
+					return out.Token, nil
 				}
 			} else {
 				var out struct {
@@ -442,6 +495,25 @@ func (s *Solver) solveTokenAPI(ctx context.Context, baseURL, sitekey string, c *
 		}
 	}
 	return "", last
+}
+
+// isLocalHost reports whether rawURL points at the local machine or a
+// private-network address. Such solve services must be reached directly
+// instead of through the route proxy.
+func isLocalHost(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
 }
 
 // retryableStatus decides which solver HTTP statuses are worth another attempt.

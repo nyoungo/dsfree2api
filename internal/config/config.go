@@ -14,6 +14,15 @@ import (
 
 const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 
+// Turnstile tuning defaults. DefaultSolveTimeoutSeconds is the single source
+// for how long one solve attempt may run; the warm_* values drive the cookie
+// pool (background pre-solving).
+const (
+	DefaultSolveTimeoutSeconds = 90
+	DefaultWarmRatio           = 0.3
+	DefaultWarmCheckSeconds    = 60
+)
+
 // Turnstile token providers: api calls a hosted solver, browser drives a
 // local Chrome/Edge over CDP, manual only ever uses imported cookies.
 const (
@@ -29,10 +38,17 @@ type Turnstile struct {
 	APIKey              string  `toml:"api_key" json:"api_key"`
 	SiteKey             string  `toml:"sitekey" json:"sitekey"`
 	Action              string  `toml:"action" json:"action"`
+	APIStyle            string  `toml:"api_style" json:"api_style"`
 	TimeoutSeconds      int     `toml:"timeout_seconds" json:"timeout_seconds"`
 	CookieTTLSeconds    int     `toml:"cookie_ttl_seconds" json:"cookie_ttl_seconds"`
 	Retries             int     `toml:"retries" json:"retries"`
 	RetryBackoffSeconds float64 `toml:"retry_backoff_seconds" json:"retry_backoff_seconds"`
+
+	// Cookie pool: a background loop re-solves a site × route slot before its
+	// cached cookie expires, so requests never pay the solve latency.
+	WarmEnabled      bool    `toml:"warm_enabled" json:"warm_enabled"`
+	WarmRatio        float64 `toml:"warm_ratio" json:"warm_ratio"`
+	WarmCheckSeconds int     `toml:"warm_check_seconds" json:"warm_check_seconds"`
 
 	// provider = "browser"
 	BrowserPath        string `toml:"browser_path" json:"browser_path"`
@@ -51,6 +67,112 @@ func (t Turnstile) ProviderValue() string {
 	return p
 }
 
+// APIStyleValue normalizes api_style for provider "api": "sync" (CapSolver-
+// shaped single POST) or "ezsolver" (POST {sitekey,siteurl,timeout} → {token}).
+func (t Turnstile) APIStyleValue() string {
+	switch strings.ToLower(strings.TrimSpace(t.APIStyle)) {
+	case "ezsolver", "ez":
+		return "ezsolver"
+	default:
+		return "sync"
+	}
+}
+
+// SolveTimeoutValue normalizes timeout_seconds: the longest one solve attempt
+// may run (default 90s, clamped to 5–600s).
+func (t Turnstile) SolveTimeoutValue() int {
+	n := t.TimeoutSeconds
+	if n <= 0 {
+		return DefaultSolveTimeoutSeconds
+	}
+	if n < 5 {
+		return 5
+	}
+	if n > 600 {
+		return 600
+	}
+	return n
+}
+
+// WarmRatioValue normalizes warm_ratio: a pooled cookie is re-solved once its
+// remaining TTL drops below this fraction (default 30%, clamped 5–95%).
+func (t Turnstile) WarmRatioValue() float64 {
+	r := t.WarmRatio
+	if r <= 0 {
+		return DefaultWarmRatio
+	}
+	if r < 0.05 {
+		return 0.05
+	}
+	if r > 0.95 {
+		return 0.95
+	}
+	return r
+}
+
+// WarmCheckValue normalizes warm_check_seconds: how often the pool is
+// inspected (default 60s, clamped 5s–1h).
+func (t Turnstile) WarmCheckValue() int {
+	n := t.WarmCheckSeconds
+	if n <= 0 {
+		return DefaultWarmCheckSeconds
+	}
+	if n < 5 {
+		return 5
+	}
+	if n > 3600 {
+		return 3600
+	}
+	return n
+}
+
+// Quota sentinel defaults: polling interval and the remaining-quota warning
+// threshold (share of the daily free limit left).
+const (
+	DefaultQuotaCheckSeconds = 300
+	DefaultQuotaWarnRatio    = 0.2
+)
+
+// QuotaWatch configures the guest-token balance sentinel: it polls each
+// site's balance endpoint with the pooled session (same egress and cookies as
+// chat) and reports remaining daily quota to the console and logs.
+type QuotaWatch struct {
+	Enabled      bool    `toml:"enabled" json:"enabled"`
+	CheckSeconds int     `toml:"check_seconds" json:"check_seconds"`
+	WarnRatio    float64 `toml:"warn_ratio" json:"warn_ratio"`
+}
+
+// CheckSecondsValue normalizes check_seconds (default 300s, clamped 30–3600).
+func (q QuotaWatch) CheckSecondsValue() int {
+	n := q.CheckSeconds
+	if n <= 0 {
+		return DefaultQuotaCheckSeconds
+	}
+	if n < 30 {
+		return 30
+	}
+	if n > 3600 {
+		return 3600
+	}
+	return n
+}
+
+// WarnRatioValue normalizes warn_ratio: remaining/limit below this fraction
+// raises a "quota low" warning (default 20%, clamped 5–95%).
+func (q QuotaWatch) WarnRatioValue() float64 {
+	r := q.WarnRatio
+	if r <= 0 {
+		return DefaultQuotaWarnRatio
+	}
+	if r < 0.05 {
+		return 0.05
+	}
+	if r > 0.95 {
+		return 0.95
+	}
+	return r
+}
+
 type Site struct {
 	Code         string `toml:"-"`
 	BaseURL      string `toml:"base_url" json:"base_url"`
@@ -59,6 +181,41 @@ type Site struct {
 	VerifyAction string `toml:"verify_action" json:"verify_action"`
 	Language     string `toml:"language" json:"language"`
 	Enabled      bool   `toml:"enabled" json:"enabled"`
+	// Proxies binds this site to the proxy pool: an ordered list of entry
+	// names and/or "sub:<name>" references. Empty = global [proxy] routes.
+	Proxies []string `toml:"proxies" json:"proxies"`
+	// WarmPoolOnly keeps the cookie warmer on the pool routes bound via
+	// Proxies; the global [proxy] primary/fallback lanes are not pre-solved
+	// (they remain available for request-time failover). Default false.
+	WarmPoolOnly bool `toml:"warm_pool_only" json:"warm_pool_only"`
+}
+
+// ProxyEntry is one manually configured pool node: an Xray share link
+// (vless/vmess/trojan/ss) or a plain http/https/socks5 endpoint.
+type ProxyEntry struct {
+	Link    string `toml:"link" json:"link"`
+	Enabled bool   `toml:"enabled" json:"enabled"`
+}
+
+// ProxySubscription is a remote node list refreshed on an interval.
+type ProxySubscription struct {
+	URL             string `toml:"url" json:"url"`
+	Enabled         bool   `toml:"enabled" json:"enabled"`
+	IntervalMinutes int    `toml:"interval_minutes" json:"interval_minutes"`
+}
+
+// ProxyPool configures the egress pool and its managed Xray core.
+type ProxyPool struct {
+	Enabled              bool                          `toml:"enabled" json:"enabled"`
+	CheckIntervalSeconds int                           `toml:"check_interval_seconds" json:"check_interval_seconds"`
+	CheckTimeoutSeconds  int                           `toml:"check_timeout_seconds" json:"check_timeout_seconds"`
+	CheckURL             string                        `toml:"check_url" json:"check_url"`
+	DefaultScheme        string                        `toml:"default_scheme" json:"default_scheme"`
+	XrayPath             string                        `toml:"xray_path" json:"xray_path"`
+	XrayVersion          string                        `toml:"xray_version" json:"xray_version"`
+	XrayAutoDownload     bool                          `toml:"xray_auto_download" json:"xray_auto_download"`
+	Entries              map[string]*ProxyEntry        `toml:"entries" json:"entries"`
+	Subscriptions        map[string]*ProxySubscription `toml:"subscriptions" json:"subscriptions"`
 }
 
 type Model struct {
@@ -77,6 +234,8 @@ type Config struct {
 		Host     string `toml:"host" json:"host"`
 		Port     int    `toml:"port" json:"port"`
 		LogLevel string `toml:"log_level" json:"log_level"`
+		// LogFile: "" = <data_dir>/logs/dsfree2api.log, "-" = stderr only.
+		LogFile string `toml:"log_file" json:"log_file"`
 	} `toml:"server" json:"server"`
 
 	Security struct {
@@ -100,6 +259,12 @@ type Config struct {
 		FallbackURLs     []string `toml:"fallback_urls" json:"fallback_urls"`
 		SlowStartSeconds float64  `toml:"slow_start_seconds" json:"slow_start_seconds"`
 	} `toml:"proxy" json:"proxy"`
+
+	ProxyPool ProxyPool `toml:"proxypool" json:"proxypool"`
+
+	// Quota is the balance sentinel: it polls each site's guest-token balance
+	// so the console shows how much daily free quota is left.
+	Quota QuotaWatch `toml:"quota" json:"quota"`
 
 	Upstream struct {
 		Timeout             float64 `toml:"timeout" json:"timeout"`
@@ -125,6 +290,20 @@ type Config struct {
 	path string       `toml:"-"`
 }
 
+// DefaultProxyPool returns the built-in pool settings (feature off, Xray
+// auto-download on).
+func DefaultProxyPool() ProxyPool {
+	return ProxyPool{
+		CheckIntervalSeconds: 120,
+		CheckTimeoutSeconds:  10,
+		CheckURL:             "https://www.gstatic.com/generate_204",
+		DefaultScheme:        "http",
+		XrayAutoDownload:     true,
+		Entries:              map[string]*ProxyEntry{},
+		Subscriptions:        map[string]*ProxySubscription{},
+	}
+}
+
 func DefaultTurnstile() Turnstile {
 	return Turnstile{
 		Enabled:             false,
@@ -133,10 +312,12 @@ func DefaultTurnstile() Turnstile {
 		APIKey:              "",
 		SiteKey:             "0x4AAAAAADlLZ3ljqZP6cQwq",
 		Action:              "chat",
-		TimeoutSeconds:      90,
+		TimeoutSeconds:      DefaultSolveTimeoutSeconds,
 		CookieTTLSeconds:    10800,
 		Retries:             5,
 		RetryBackoffSeconds: 1.5,
+		WarmRatio:           DefaultWarmRatio,
+		WarmCheckSeconds:    DefaultWarmCheckSeconds,
 	}
 }
 
@@ -201,6 +382,7 @@ func newConfig() *Config {
 	c.Upstream.CrossSiteFailover = true
 	c.Upstream.ContinueRounds = 20
 	c.Runtime.DataDir = "./data"
+	c.ProxyPool = DefaultProxyPool()
 	c.Turnstile = DefaultTurnstile()
 	c.Sites = DefaultSites(c.Turnstile.SiteKey)
 	c.Models = DefaultModels()
@@ -300,21 +482,35 @@ func (c *Config) applyDefaults(md *toml.MetaData) {
 		c.Turnstile.Enabled = true
 		c.Upstream.AutoRefresh = true
 		c.Upstream.ContinueRounds = 20
+		c.ProxyPool.XrayAutoDownload = true
 		for _, s := range c.Sites {
 			s.Enabled = true
 		}
 		for _, m := range c.Models {
 			m.Enabled = true
 		}
+		for _, e := range c.ProxyPool.Entries {
+			e.Enabled = true
+		}
+		for _, sc := range c.ProxyPool.Subscriptions {
+			sc.Enabled = true
+		}
 		return
 	}
 	def(md.IsDefined("turnstile", "enabled"), &c.Turnstile.Enabled, true)
 	def(md.IsDefined("upstream", "auto_refresh"), &c.Upstream.AutoRefresh, true)
+	def(md.IsDefined("proxypool", "xray_auto_download"), &c.ProxyPool.XrayAutoDownload, true)
 	for code, s := range c.Sites {
 		def(md.IsDefined("sites", code, "enabled"), &s.Enabled, true)
 	}
 	for id, m := range c.Models {
 		def(md.IsDefined("models", id, "enabled"), &m.Enabled, true)
+	}
+	for name, e := range c.ProxyPool.Entries {
+		def(md.IsDefined("proxypool", "entries", name, "enabled"), &e.Enabled, true)
+	}
+	for name, sc := range c.ProxyPool.Subscriptions {
+		def(md.IsDefined("proxypool", "subscriptions", name, "enabled"), &sc.Enabled, true)
 	}
 }
 
@@ -330,6 +526,9 @@ func (c *Config) applyEnv() error {
 	}
 	if v := str("LOG_LEVEL"); v != nil {
 		c.Server.LogLevel = *v
+	}
+	if v := str("LOG_FILE"); v != nil {
+		c.Server.LogFile = strings.TrimSpace(*v)
 	}
 	if v := str("PORT"); v != nil {
 		n, err := strconv.Atoi(strings.TrimSpace(*v))
@@ -362,6 +561,34 @@ func (c *Config) applyEnv() error {
 	}
 	if v := str("TURNSTILE_BROWSER_PATH"); v != nil && strings.TrimSpace(*v) != "" {
 		c.Turnstile.BrowserPath = strings.TrimSpace(*v)
+	}
+	if v := str("TURNSTILE_TIMEOUT_SECONDS"); v != nil {
+		n, err := strconv.Atoi(strings.TrimSpace(*v))
+		if err != nil || n < 1 {
+			return fmt.Errorf("invalid TURNSTILE_TIMEOUT_SECONDS %q", *v)
+		}
+		c.Turnstile.TimeoutSeconds = n
+	}
+	if v := str("TURNSTILE_WARM_ENABLED"); v != nil {
+		b, err := strconv.ParseBool(strings.TrimSpace(*v))
+		if err != nil {
+			return fmt.Errorf("invalid TURNSTILE_WARM_ENABLED %q", *v)
+		}
+		c.Turnstile.WarmEnabled = b
+	}
+	if v := str("TURNSTILE_WARM_RATIO"); v != nil {
+		f, err := strconv.ParseFloat(strings.TrimSpace(*v), 64)
+		if err != nil || f <= 0 || f > 1 {
+			return fmt.Errorf("invalid TURNSTILE_WARM_RATIO %q (expected 0–1)", *v)
+		}
+		c.Turnstile.WarmRatio = f
+	}
+	if v := str("TURNSTILE_WARM_CHECK_SECONDS"); v != nil {
+		n, err := strconv.Atoi(strings.TrimSpace(*v))
+		if err != nil || n < 1 {
+			return fmt.Errorf("invalid TURNSTILE_WARM_CHECK_SECONDS %q", *v)
+		}
+		c.Turnstile.WarmCheckSeconds = n
 	}
 	if v := str("TURNSTILE_ENABLED"); v != nil {
 		b, err := strconv.ParseBool(strings.TrimSpace(*v))
@@ -452,7 +679,8 @@ func (c *Config) validateTurnstile() error {
 		if c.Turnstile.APIURL == "" {
 			return errors.New("turnstile.api_url is empty (set config to your solver endpoint, or use provider = \"manual\")")
 		}
-		if c.Turnstile.APIKey == "" {
+		// Local solve services (api_style = "ezsolver") usually need no key.
+		if c.Turnstile.APIKey == "" && c.Turnstile.APIStyleValue() != "ezsolver" {
 			return errors.New("turnstile.api_key is empty (set config, or TURNSTILE_API_KEY)")
 		}
 	case ProviderBrowser:

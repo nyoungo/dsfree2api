@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/nyoungo/dsfree2api/internal/config"
 	"github.com/nyoungo/dsfree2api/internal/httpx"
 	"github.com/nyoungo/dsfree2api/internal/openai"
+	"github.com/nyoungo/dsfree2api/internal/proxypool"
 	"github.com/nyoungo/dsfree2api/internal/upstream"
 )
 
@@ -233,12 +235,20 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 			Challenge string  `json:"challenge_action"`
 			Legacy    string  `json:"ts_action"`
 			CookieTT  int     `json:"cookie_ttl_seconds"`
+			APIStyle  *string `json:"api_style"`
 
 			BrowserPath        *string `json:"browser_path"`
 			BrowserHeadless    *bool   `json:"browser_headless"`
 			BrowserUserDataDir *string `json:"browser_user_data_dir"`
 			BrowserTimezone    *string `json:"browser_timezone"`
 			BrowserLocale      *string `json:"browser_locale"`
+
+			TimeoutSeconds      *int     `json:"timeout_seconds"`
+			Retries             *int     `json:"retries"`
+			RetryBackoffSeconds *float64 `json:"retry_backoff_seconds"`
+			WarmEnabled         *bool    `json:"warm_enabled"`
+			WarmRatio           *float64 `json:"warm_ratio"`
+			WarmCheckSeconds    *int     `json:"warm_check_seconds"`
 		}
 		_ = json.Unmarshal(body, &p)
 		// Build the candidate config first: a rejected save must not leave
@@ -275,8 +285,29 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		if act := firstNonEmpty(p.Challenge, p.Legacy); act != "" {
 			tc.Action = act
 		}
+		if p.APIStyle != nil {
+			tc.APIStyle = strings.ToLower(strings.TrimSpace(*p.APIStyle))
+		}
 		if p.CookieTT > 0 {
 			tc.CookieTTLSeconds = p.CookieTT
+		}
+		if p.TimeoutSeconds != nil {
+			tc.TimeoutSeconds = clampInt(*p.TimeoutSeconds, 5, 600)
+		}
+		if p.Retries != nil {
+			tc.Retries = clampInt(*p.Retries, 1, 20)
+		}
+		if p.RetryBackoffSeconds != nil {
+			tc.RetryBackoffSeconds = clampFloat(*p.RetryBackoffSeconds, 0, 60)
+		}
+		if p.WarmEnabled != nil {
+			tc.WarmEnabled = *p.WarmEnabled
+		}
+		if p.WarmRatio != nil {
+			tc.WarmRatio = clampFloat(*p.WarmRatio, 0.05, 0.95)
+		}
+		if p.WarmCheckSeconds != nil {
+			tc.WarmCheckSeconds = clampInt(*p.WarmCheckSeconds, 5, 3600)
 		}
 		tc.Enabled = p.Enabled
 		if tc.Enabled {
@@ -395,6 +426,218 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal(body, &p)
 		writeJSON(w, http.StatusOK, s.rotateGuest(p.Site))
+
+	case "pool_set_config":
+		var p struct {
+			Enabled              *bool   `json:"enabled"`
+			CheckIntervalSeconds *int    `json:"check_interval_seconds"`
+			CheckTimeoutSeconds  *int    `json:"check_timeout_seconds"`
+			CheckURL             *string `json:"check_url"`
+			DefaultScheme        *string `json:"default_scheme"`
+			XrayPath             *string `json:"xray_path"`
+			XrayVersion          *string `json:"xray_version"`
+			XrayAutoDownload     *bool   `json:"xray_auto_download"`
+		}
+		_ = json.Unmarshal(body, &p)
+		s.cfg.Lock()
+		pc := s.cfg.ProxyPool
+		if p.Enabled != nil {
+			pc.Enabled = *p.Enabled
+		}
+		if p.CheckIntervalSeconds != nil {
+			pc.CheckIntervalSeconds = clampInt(*p.CheckIntervalSeconds, 10, 3600)
+		}
+		if p.CheckTimeoutSeconds != nil {
+			pc.CheckTimeoutSeconds = clampInt(*p.CheckTimeoutSeconds, 2, 120)
+		}
+		if p.CheckURL != nil {
+			pc.CheckURL = strings.TrimSpace(*p.CheckURL)
+		}
+		if p.DefaultScheme != nil {
+			pc.DefaultScheme = strings.ToLower(strings.TrimSpace(*p.DefaultScheme))
+		}
+		if p.XrayPath != nil {
+			pc.XrayPath = strings.TrimSpace(*p.XrayPath)
+		}
+		if p.XrayVersion != nil {
+			pc.XrayVersion = strings.TrimSpace(*p.XrayVersion)
+		}
+		if p.XrayAutoDownload != nil {
+			pc.XrayAutoDownload = *p.XrayAutoDownload
+		}
+		s.cfg.ProxyPool = pc
+		s.cfg.Unlock()
+		s.poolReload()
+		s.save(w)
+
+	case "pool_add_entry":
+		var p struct {
+			Name string `json:"name"`
+			Link string `json:"link"`
+		}
+		_ = json.Unmarshal(body, &p)
+		p.Name, p.Link = strings.TrimSpace(p.Name), strings.TrimSpace(p.Link)
+		if !validPoolName(p.Name) {
+			fail(w, "name must match [A-Za-z0-9_-]{1,64}")
+			return
+		}
+		if p.Link == "" {
+			fail(w, "link is required")
+			return
+		}
+		s.cfg.RLock()
+		scheme := s.cfg.ProxyPool.DefaultScheme
+		_, exists := s.cfg.ProxyPool.Entries[p.Name]
+		s.cfg.RUnlock()
+		if exists {
+			fail(w, "entry already exists: "+p.Name)
+			return
+		}
+		if _, err := proxypool.ParseNode(p.Link, scheme); err != nil {
+			fail(w, "node parse: "+err.Error())
+			return
+		}
+		s.cfg.Lock()
+		if s.cfg.ProxyPool.Entries == nil {
+			s.cfg.ProxyPool.Entries = map[string]*config.ProxyEntry{}
+		}
+		s.cfg.ProxyPool.Entries[p.Name] = &config.ProxyEntry{Link: p.Link, Enabled: true}
+		s.cfg.Unlock()
+		s.poolReload()
+		s.save(w)
+
+	case "pool_toggle_entry", "pool_toggle_sub":
+		var p struct {
+			Name    string `json:"name"`
+			Enabled bool   `json:"enabled"`
+		}
+		_ = json.Unmarshal(body, &p)
+		s.cfg.Lock()
+		ok := false
+		if req.Action == "pool_toggle_entry" {
+			if e := s.cfg.ProxyPool.Entries[p.Name]; e != nil {
+				e.Enabled = p.Enabled
+				ok = true
+			}
+		} else {
+			if sc := s.cfg.ProxyPool.Subscriptions[p.Name]; sc != nil {
+				sc.Enabled = p.Enabled
+				ok = true
+			}
+		}
+		s.cfg.Unlock()
+		if !ok {
+			fail(w, "not found: "+p.Name)
+			return
+		}
+		s.poolReload()
+		s.save(w)
+
+	case "pool_delete_entry", "pool_delete_sub":
+		var p struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(body, &p)
+		ref := p.Name
+		if req.Action == "pool_delete_sub" {
+			ref = "sub:" + p.Name
+		}
+		s.cfg.Lock()
+		if req.Action == "pool_delete_entry" {
+			delete(s.cfg.ProxyPool.Entries, p.Name)
+		} else {
+			delete(s.cfg.ProxyPool.Subscriptions, p.Name)
+		}
+		for _, st := range s.cfg.Sites {
+			if st != nil {
+				st.Proxies = removeString(st.Proxies, ref)
+			}
+		}
+		s.cfg.Unlock()
+		s.poolReload()
+		s.save(w)
+
+	case "pool_add_sub":
+		var p struct {
+			Name            string `json:"name"`
+			URL             string `json:"url"`
+			IntervalMinutes int    `json:"interval_minutes"`
+		}
+		_ = json.Unmarshal(body, &p)
+		p.Name, p.URL = strings.TrimSpace(p.Name), strings.TrimSpace(p.URL)
+		if !validPoolName(p.Name) {
+			fail(w, "name must match [A-Za-z0-9_-]{1,64}")
+			return
+		}
+		if p.URL == "" {
+			fail(w, "url is required")
+			return
+		}
+		s.cfg.Lock()
+		if s.cfg.ProxyPool.Subscriptions == nil {
+			s.cfg.ProxyPool.Subscriptions = map[string]*config.ProxySubscription{}
+		}
+		if _, exists := s.cfg.ProxyPool.Subscriptions[p.Name]; exists {
+			s.cfg.Unlock()
+			fail(w, "subscription already exists: "+p.Name)
+			return
+		}
+		if p.IntervalMinutes <= 0 {
+			p.IntervalMinutes = 60
+		}
+		s.cfg.ProxyPool.Subscriptions[p.Name] = &config.ProxySubscription{
+			URL: p.URL, Enabled: true,
+			IntervalMinutes: clampInt(p.IntervalMinutes, 5, 1440),
+		}
+		s.cfg.Unlock()
+		s.poolReload()
+		s.save(w)
+
+	case "pool_set_site":
+		var p struct {
+			Site    string   `json:"site"`
+			Proxies []string `json:"proxies"`
+		}
+		_ = json.Unmarshal(body, &p)
+		clean := make([]string, 0, len(p.Proxies))
+		for _, item := range p.Proxies {
+			if item = strings.TrimSpace(item); item != "" {
+				clean = append(clean, item)
+			}
+		}
+		s.cfg.Lock()
+		st, ok := s.cfg.Sites[p.Site]
+		if ok && st != nil {
+			for _, item := range clean {
+				if name, isSub := strings.CutPrefix(item, "sub:"); isSub {
+					if s.cfg.ProxyPool.Subscriptions[name] == nil {
+						s.cfg.Unlock()
+						fail(w, "unknown subscription: "+name)
+						return
+					}
+				} else if s.cfg.ProxyPool.Entries[item] == nil {
+					s.cfg.Unlock()
+					fail(w, "unknown entry: "+item)
+					return
+				}
+			}
+			st.Proxies = clean
+		}
+		s.cfg.Unlock()
+		if !ok || st == nil {
+			fail(w, "unknown site: "+p.Site)
+			return
+		}
+		s.poolReload()
+		s.save(w)
+
+	case "pool_refresh":
+		if s.pool == nil {
+			fail(w, "proxy pool is not available")
+			return
+		}
+		s.pool.RefreshNow(context.Background())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 
 	default:
 		fail(w, "unknown action: "+req.Action)
@@ -672,4 +915,46 @@ func randomToken(n int) string {
 		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func clampFloat(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+var poolNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func validPoolName(name string) bool { return poolNameRe.MatchString(name) }
+
+// removeString drops every occurrence of want from list (in place copy).
+func removeString(list []string, want string) []string {
+	out := list[:0:0]
+	for _, v := range list {
+		if v != want {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// poolReload pushes pool-relevant config changes into the live manager.
+func (s *Server) poolReload() {
+	if s.pool != nil {
+		s.pool.Reload()
+	}
 }

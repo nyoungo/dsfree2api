@@ -32,7 +32,7 @@ func TestRoutesKeepPrimaryFirstAndDedupe(t *testing.T) {
 	cfg.Proxy.URL = ""
 	cfg.Proxy.FallbackURLs = []string{"socks5://fallback:1", "socks5://fallback:1"}
 
-	c := New(cfg, nil, nil)
+	c := New(cfg, nil, nil, nil)
 	got := c.Routes()
 	want := []Route{{Name: "primary", Proxy: ""}, {Name: "fallback-1", Proxy: "socks5://fallback:1"}}
 	if !reflect.DeepEqual(got, want) {
@@ -47,7 +47,7 @@ func TestSlowPrimarySwitchesToFallbackBeforeContent(t *testing.T) {
 	cfg.Proxy.SlowStartSeconds = 0.02
 
 	var calls []string
-	c := New(cfg, nil, nil)
+	c := New(cfg, nil, nil, nil)
 	c.chatOnceOverride = func(ctx context.Context, site config.Site, modelID string, model config.Model,
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error {
 		calls = append(calls, route.Name)
@@ -86,7 +86,7 @@ func TestPrimaryErrorSwitchesToFallbackBeforeContent(t *testing.T) {
 	cfg.Proxy.FallbackURLs = []string{"socks5://fallback:1"}
 
 	var calls []string
-	c := New(cfg, nil, nil)
+	c := New(cfg, nil, nil, nil)
 	c.chatOnceOverride = func(ctx context.Context, site config.Site, modelID string, model config.Model,
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error {
 		calls = append(calls, route.Name)
@@ -119,7 +119,7 @@ func TestNoFallbackAfterContentStarted(t *testing.T) {
 	cfg.Proxy.FallbackURLs = []string{"socks5://fallback:1"}
 
 	var calls []string
-	c := New(cfg, nil, nil)
+	c := New(cfg, nil, nil, nil)
 	c.chatOnceOverride = func(ctx context.Context, site config.Site, modelID string, model config.Model,
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error {
 		calls = append(calls, route.Name)
@@ -141,6 +141,32 @@ func TestNoFallbackAfterContentStarted(t *testing.T) {
 	}
 	if want := []string{"primary"}; !reflect.DeepEqual(calls, want) {
 		t.Errorf("calls = %v, want %v", calls, want)
+	}
+}
+
+func TestQuotaObserverFiresOncePerSiteBeforeFailover(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Upstream.AutoRefresh = false
+	c := New(cfg, nil, nil, nil)
+	c.chatOnceOverride = func(ctx context.Context, site config.Site, modelID string, model config.Model,
+		prompt string, route Route, info *ServeInfo, yield func(Event) error) error {
+		if site.Code == "de" {
+			return newQuota(`sse quota exhausted: {"quota_notice":{}}`)
+		}
+		yield(Event{Kind: KindDelta, Value: "ok"})
+		return nil
+	}
+	var fired []string
+	c.SetQuotaObserver(func(site, model, route string, err error) {
+		fired = append(fired, site+"|"+model+"|"+route)
+	})
+
+	if err := c.Chat(context.Background(), "deepseek-v4-flash-de", "hi", &ServeInfo{},
+		func(ev Event) error { return nil }); err != nil {
+		t.Fatalf("chat should succeed via cross-site failover: %v", err)
+	}
+	if len(fired) != 1 || fired[0] != "de|deepseek-v4-flash-de|primary" {
+		t.Fatalf("quota observer events = %v, want [de|deepseek-v4-flash-de|primary]", fired)
 	}
 }
 
@@ -211,7 +237,7 @@ func TestTurnstileRequiredWhileDisabledFailsFast(t *testing.T) {
 	cfg.Upstream.RefreshRetries = 4
 
 	var calls int
-	c := New(cfg, nil, nil)
+	c := New(cfg, nil, nil, nil)
 	c.chatOnceOverride = func(ctx context.Context, site config.Site, modelID string, model config.Model,
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error {
 		calls++
@@ -237,7 +263,7 @@ func TestNonceFetchFailureFailsFast(t *testing.T) {
 	cfg.Upstream.RefreshRetries = 4
 
 	var calls int
-	c := New(cfg, nil, nil)
+	c := New(cfg, nil, nil, nil)
 	c.chatOnceOverride = func(ctx context.Context, site config.Site, modelID string, model config.Model,
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error {
 		calls++
@@ -273,7 +299,7 @@ func TestSSEDeltaAndDoneEvents(t *testing.T) {
 
 func TestQuotaSiteCoolsDownAndPrefersSibling(t *testing.T) {
 	cfg := testConfig(t)
-	c := New(cfg, nil, nil)
+	c := New(cfg, nil, nil, nil)
 	calls := map[string]int{}
 	c.chatOnceOverride = func(_ context.Context, site config.Site, modelID string, model config.Model,
 		_ string, _ Route, _ *ServeInfo, _ func(Event) error) error {
@@ -318,7 +344,7 @@ func TestCacheEmptyFailsOverToMirrorWithoutRefreshCycles(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Upstream.AutoRefresh = true
 	cfg.Upstream.RefreshRetries = 3
-	c := New(cfg, nil, nil)
+	c := New(cfg, nil, nil, nil)
 	calls := map[string]int{}
 	c.chatOnceOverride = func(_ context.Context, site config.Site, modelID string, model config.Model,
 		_ string, _ Route, _ *ServeInfo, _ func(Event) error) error {
@@ -348,7 +374,7 @@ func TestQuotaRotationRecoversWithoutSolve(t *testing.T) {
 	if _, _, err := solver.ImportCookies("de", "cf_clearance=abc; dsgt_gid="+oldGid, ""); err != nil {
 		t.Fatalf("seed cookies: %v", err)
 	}
-	c := New(cfg, solver, nil)
+	c := New(cfg, solver, nil, nil)
 	calls := 0
 	c.chatOnceOverride = func(_ context.Context, site config.Site, modelID string, model config.Model,
 		_ string, _ Route, _ *ServeInfo, _ func(Event) error) error {

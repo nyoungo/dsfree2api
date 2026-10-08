@@ -1,13 +1,18 @@
 ﻿# dsfree2api 示例配置。
 # 复制为 config.toml 后按需修改；运行 `dsfree2api -check -config config.toml` 可校验。
-# 环境变量优先级高于本文件：HOST PORT LOG_LEVEL API_KEYS PROXY_URL PROXY_FALLBACK_URLS
+# 环境变量优先级高于本文件：HOST PORT LOG_LEVEL LOG_FILE API_KEYS PROXY_URL PROXY_FALLBACK_URLS
 # PROXY_SLOW_START_SECONDS TURNSTILE_ENABLED TURNSTILE_API_KEY TURNSTILE_PROVIDER
-# TURNSTILE_BROWSER_PATH ADMIN_ENABLED ADMIN_HOST ADMIN_PORT ADMIN_PASSWORD DATA_DIR
+# TURNSTILE_BROWSER_PATH TURNSTILE_TIMEOUT_SECONDS TURNSTILE_WARM_ENABLED
+# TURNSTILE_WARM_RATIO TURNSTILE_WARM_CHECK_SECONDS
+# ADMIN_ENABLED ADMIN_HOST ADMIN_PORT ADMIN_PASSWORD DATA_DIR
 
 [server]
 host = "0.0.0.0"
 port = 8000
 log_level = "INFO"
+# 日志文件：留空写入 <data_dir>/logs/dsfree2api.log；填路径则写到该文件；
+# "-" = 仅终端。日志按天轮转，旧文件压缩为 <名称>-YYYY-MM-DD.log.gz。
+log_file = ""
 
 [security]
 # 下游鉴权。空数组 = 不鉴权；建议部署时换成自己的 key。
@@ -33,6 +38,37 @@ fallback_urls = []
 # 主线路允许的首事件等待秒数（>0 且存在备用线路时生效）。
 slow_start_seconds = 8
 
+[proxypool]
+# 代理池：为每个站点绑定独立出口（Xray 分享链接 / 订阅 / ip:port 端点）。
+# 选路为粘性：优先使用绑定列表中第一个健康节点，失败才切换；未绑定或
+# 全部不健康时回退到上面的 [proxy] 主/备线路。Turnstile 求解与请求共用
+# 同一出口（Cookie 与出口 IP 绑定，换出口后会自动重新求解）。
+enabled = false
+check_interval_seconds = 120   # 健康检查间隔
+check_timeout_seconds = 10     # 单次探测超时
+check_url = "https://www.gstatic.com/generate_204"
+default_scheme = "http"        # 裸 ip:port 的默认协议（http / socks5）
+# Xray 核心：留空 xray_path 且开启自动下载时，首次使用会下载到数据目录
+# （data/xray.exe；核心配置写到 data/config.json）。分享链接（vless / vmess
+# / trojan / ss）由它承载；纯 ip:port / socks5:// 端点无需核心。
+xray_path = ""
+xray_version = ""              # 留空 = 最新版
+xray_auto_download = true
+
+# 手动节点（名称限字母 / 数字 / - / _）：
+# [proxypool.entries.node-a]
+# link = "vless://uuid@host:443?type=ws&security=tls&sni=example.com&path=/ws#node-a"
+# link = "socks5://user:pass@1.2.3.4:1080"
+# link = "1.2.3.4:8080"                  # 使用 default_scheme
+# link = "1.2.3.4:8080:user:pass"
+# enabled = true                          # 缺省即启用
+
+# 订阅（按 interval_minutes 自动刷新；节点名形如 <订阅名>#xxxxxxxx）：
+# [proxypool.subscriptions.home]
+# url = "https://example.com/api/v1/client/subscribe?token=…"
+# interval_minutes = 60
+# enabled = true
+
 [upstream]
 timeout = 60.0
 stream_timeout = 300.0
@@ -56,7 +92,8 @@ continue_rounds = 20
 #   manual  —— 只用控制台手动导入的 Cookie（方式 3）
 enabled = false
 provider = "api"
-# 方式 1：求解服务 API
+# 方式 1：求解服务 API（api_style = "sync" 为默认 CapSolver 形状；
+# api_style = "ezsolver" 适配本地 EzSolver 服务，api_key 可留空）
 # api_url = "https://your-solver.example.com/turnstile/sync"
 # api_key = "REPLACE_ME"
 # 方式 2：本地浏览器自动获取（CDP 直连，无需 Playwright / Docker）
@@ -67,10 +104,26 @@ provider = "api"
 # browser_locale = ""                   # 可选：如 "ja-JP"，留空取站点语言
 sitekey = "0x4AAAAAADlLZ3ljqZP6cQwq"
 action = "chat"
+# 求解超时：单次求解（浏览器 / 求解服务 API）的最长等待秒数，5–600。
 timeout_seconds = 90
 cookie_ttl_seconds = 10800
 retries = 5
 retry_backoff_seconds = 1.5
+# ── Cookie 池（后台预热）─────────────────────────────────
+# 开启后，后台按 warm_check_seconds 巡检：Cookie 缺失 / 过期 /
+# 剩余 TTL 低于 warm_ratio 时主动重解并写回缓存，请求路径不再等待求解。
+# provider = "manual" 时不预热（手动导入的 Cookie 无法自动续期）。
+warm_enabled = false
+warm_ratio = 0.3            # 剩余 TTL 低于该比例（0.05–0.95）时触发预热
+warm_check_seconds = 60     # 后台巡检间隔秒数（5–3600）
+
+# ── 配额哨兵（站点免费额度实时监控）──────────────
+# 用与聊天相同的出口 Cookie 定期查询站点余额接口（每日免费额度），结果
+# 写入日志与后台 /api/overview 的 quota 区域；剩余低于 warn_ratio 时告警。
+[quota]
+enabled = false
+check_seconds = 300
+warn_ratio = 0.2
 
 [runtime]
 data_dir = "./data"
@@ -80,6 +133,11 @@ base_url = "https://deepseek.de"
 ajax_url = "https://deepseek.de/wp-admin/admin-ajax.php"
 sitekey = "0x4AAAAAADlLZ3ljqZP6cQwq"
 language = "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+# 站点级出口绑定（代理池条目名或 "sub:订阅名"，按顺序粘性选路）；
+# 留空 = 使用 [proxy] 主/备线路。三个站点可各自独立配置。
+# proxies = ["node-a", "sub:home"]
+# 只预热代理池线路（不预热 [proxy] 主/备；请求时仍可回落）：
+# warm_pool_only = true
 
 [sites.es]
 base_url = "https://deepseek.es"

@@ -100,6 +100,11 @@ func TestValidateRejectsBadValues(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Error("expected error for empty turnstile api_key")
 	}
+	cfg.Turnstile.APIStyle = "ezsolver"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("ezsolver style without api_key: %v", err)
+	}
+	cfg.Turnstile.APIStyle = ""
 	cfg.Turnstile.APIKey = "k"
 	cfg.Turnstile.Enabled = false
 	cfg.Admin.Port = cfg.Server.Port
@@ -201,6 +206,78 @@ func TestTurnstileProviderEnv(t *testing.T) {
 	}
 	if cfg.Turnstile.BrowserPath != `C:\browsers\chrome.exe` {
 		t.Errorf("browser_path = %q", cfg.Turnstile.BrowserPath)
+	}
+}
+
+func TestProxyPoolDefaults(t *testing.T) {
+	d := DefaultProxyPool()
+	if d.Enabled {
+		t.Error("proxy pool must be opt-in")
+	}
+	if !d.XrayAutoDownload || d.CheckIntervalSeconds != 120 || d.CheckTimeoutSeconds != 10 {
+		t.Errorf("pool defaults = %+v", d)
+	}
+	if d.DefaultScheme != "http" {
+		t.Errorf("default scheme = %q", d.DefaultScheme)
+	}
+	cfg, err := Load(examplePath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.ProxyPool.XrayAutoDownload {
+		t.Error("example config should keep xray_auto_download = true")
+	}
+	if cfg.ProxyPool.CheckIntervalSeconds != 120 {
+		t.Errorf("check interval = %d", cfg.ProxyPool.CheckIntervalSeconds)
+	}
+}
+
+func TestTurnstileSolveTimeoutAndWarmDefaults(t *testing.T) {
+	d := DefaultTurnstile()
+	if d.WarmEnabled {
+		t.Error("cookie pool must be opt-in")
+	}
+	if d.WarmRatio != 0.3 || d.WarmCheckSeconds != 60 {
+		t.Errorf("warm defaults = %v / %v", d.WarmRatio, d.WarmCheckSeconds)
+	}
+	z := Turnstile{}
+	if z.SolveTimeoutValue() != 90 {
+		t.Errorf("zero timeout should normalize to 90, got %d", z.SolveTimeoutValue())
+	}
+	if z.WarmRatioValue() != 0.3 || z.WarmCheckValue() != 60 {
+		t.Errorf("zero warm values should normalize to 0.3 / 60")
+	}
+	if got := (Turnstile{TimeoutSeconds: 1}).SolveTimeoutValue(); got != 5 {
+		t.Errorf("timeout floor = %d, want 5", got)
+	}
+	if got := (Turnstile{TimeoutSeconds: 9999}).SolveTimeoutValue(); got != 600 {
+		t.Errorf("timeout ceiling = %d, want 600", got)
+	}
+	if got := (Turnstile{WarmRatio: 0.99}).WarmRatioValue(); got != 0.95 {
+		t.Errorf("warm ratio ceiling = %v, want 0.95", got)
+	}
+	if (Turnstile{}).APIStyleValue() != "sync" {
+		t.Error("zero api_style should normalize to sync")
+	}
+	if (Turnstile{APIStyle: "EzSolver"}).APIStyleValue() != "ezsolver" {
+		t.Error("api_style should normalize EzSolver")
+	}
+}
+
+func TestTurnstileSolveAndWarmEnvOverrides(t *testing.T) {
+	t.Setenv("TURNSTILE_TIMEOUT_SECONDS", "45")
+	t.Setenv("TURNSTILE_WARM_ENABLED", "true")
+	t.Setenv("TURNSTILE_WARM_RATIO", "0.5")
+	t.Setenv("TURNSTILE_WARM_CHECK_SECONDS", "120")
+	cfg, err := Load(examplePath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Turnstile.TimeoutSeconds != 45 {
+		t.Errorf("timeout = %d, want 45", cfg.Turnstile.TimeoutSeconds)
+	}
+	if !cfg.Turnstile.WarmEnabled || cfg.Turnstile.WarmRatio != 0.5 || cfg.Turnstile.WarmCheckSeconds != 120 {
+		t.Errorf("warm env = %+v", cfg.Turnstile)
 	}
 }
 

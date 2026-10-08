@@ -35,6 +35,19 @@ func (r Route) Key() string {
 	return r.Proxy
 }
 
+// RouteCandidate is one egress route supplied by the proxy pool.
+type RouteCandidate struct {
+	Name  string
+	Proxy string
+}
+
+// RouteSource resolves per-site route candidates and records request
+// outcomes. Implemented by proxypool.Manager; nil when the pool is unused.
+type RouteSource interface {
+	Candidates(site string) []RouteCandidate
+	Report(proxy string, ok bool)
+}
+
 type chatConfig struct {
 	BotID     int
 	PostID    int
@@ -44,9 +57,10 @@ type chatConfig struct {
 }
 
 type Client struct {
-	cfg *config.Config
-	ts  *turnstile.Solver
-	log *slog.Logger
+	cfg  *config.Config
+	ts   *turnstile.Solver
+	log  *slog.Logger
+	pool RouteSource
 
 	stateMu  sync.Mutex
 	chatCfg  map[string]chatConfig
@@ -61,12 +75,17 @@ type Client struct {
 	lastWarnMsg string
 	lastWarnAt  time.Time
 
+	// quotaObserver, when set, is notified on the first site-side quota
+	// exhaustion of each request — including ones hidden by cross-site
+	// failover.
+	quotaObserver func(site, model, route string, err error)
+
 	// chatOnceOverride is a test seam; nil in production.
 	chatOnceOverride func(ctx context.Context, site config.Site, modelID string, model config.Model,
 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error
 }
 
-func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger) *Client {
+func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger, pool RouteSource) *Client {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -74,11 +93,19 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger) *Client {
 		cfg:       cfg,
 		ts:        ts,
 		log:       log,
+		pool:      pool,
 		chatCfg:   map[string]chatConfig{},
 		cfgLocks:  map[string]*sync.Mutex{},
 		gates:     map[string]chan struct{}{},
 		quotaCool: map[string]time.Time{},
 	}
+}
+
+// SetQuotaObserver registers a callback that fires whenever a site reports
+// quota exhaustion, even when cross-site failover later succeeds and the error
+// would otherwise never surface. Set it before serving requests.
+func (c *Client) SetQuotaObserver(fn func(site, model, route string, err error)) {
+	c.quotaObserver = fn
 }
 
 // Routes returns the primary proxy followed by the fallbacks, deduplicated.
@@ -241,6 +268,40 @@ func (c *Client) logCacheReject(site, modelID, prompt string) {
 		"head", strconv.Quote(head), "tail", strconv.Quote(tail))
 }
 
+// routesFor returns the ordered candidate routes for one site: proxy-pool
+// candidates first (sticky, health filtered), then the global primary and
+// fallback lines as the safety net.
+func (c *Client) routesFor(siteCode string) []Route {
+	out := make([]Route, 0, 4)
+	seen := map[string]bool{}
+	add := func(r Route) {
+		key := r.Key()
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, r)
+	}
+	if c.pool != nil {
+		for _, cand := range c.pool.Candidates(siteCode) {
+			add(Route{Name: cand.Name, Proxy: cand.Proxy})
+		}
+	}
+	for _, r := range c.Routes() {
+		add(r)
+	}
+	return out
+}
+
+// poolReport feeds a route outcome back to the proxy pool; it is a no-op for
+// global routes and the direct connection.
+func (c *Client) poolReport(proxy string, ok bool) {
+	if c.pool == nil || proxy == "" {
+		return
+	}
+	c.pool.Report(proxy, ok)
+}
+
 // Chat streams the prompt through the upstream site, honouring route
 // failover, slow-start detection, session refresh and cross-site failover.
 func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *ServeInfo, yield func(Event) error) error {
@@ -357,23 +418,33 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 	if !site.Enabled {
 		return errf("site %s is disabled", model.Site)
 	}
-	routes := c.Routes()
+	routes := c.routesFor(site.Code)
+	quotaNotified := false
 
 	var lastErr error
 	sawQuota := false
 	for attempt := 0; ; attempt++ {
 		var failed []Route
 		for i, route := range routes {
-			allowSlow := i == 0 && len(routes) > 1
+			// A first-time Turnstile solve can far exceed the slow-start
+			// budget; only arm the timer when cookies are already cached
+			// (or no solver is configured at all).
+			cookiesReady := c.ts == nil || c.ts.CookiesReady(site.Code, route.Proxy)
+			allowSlow := i == 0 && len(routes) > 1 && cookiesReady
 			err := c.chatOnceSlowStart(ctx, site, modelID, model, prompt, route, allowSlow, info, yield)
 			if err == nil {
 				if sawQuota {
 					c.clearQuotaCool(site.Code)
 					c.probeBalanceAsync(site, model, route)
 				}
+				c.poolReport(route.Proxy, true)
 				return nil
 			}
 			lastErr = err
+			if isQuota(err) && !quotaNotified && c.quotaObserver != nil {
+				quotaNotified = true
+				c.quotaObserver(site.Code, modelID, route.Name, err)
+			}
 			if contentStarted(err) {
 				return AsUpstream(err)
 			}
@@ -399,6 +470,11 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 			// the caller can fail over to a mirror right away.
 			if isCacheEmptyProblem(err) {
 				return AsUpstream(err)
+			}
+			// Quota/session failures are site-side, not proxy-side — do not
+			// blame the egress endpoint for them.
+			if !isQuota(err) && !isSession(err) {
+				c.poolReport(route.Proxy, false)
 			}
 			failed = append(failed, route)
 			c.logUpstreamErr(site.Code, modelID, attempt, route, err)

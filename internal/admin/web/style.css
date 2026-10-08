@@ -83,6 +83,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
 .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;border:1px solid var(--line);color:var(--muted)}
 .pill.on{color:var(--ok);border-color:#1f6a34;background:#0f2318}
 .pill.off{color:var(--dim)}
+.pill.warn{color:var(--warn);border-color:#6b5417;background:#2a2210}
 
 /* console / logs */
 .log-box{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:10px;height:56vh;overflow:auto;font-family:var(--mono);font-size:12.5px;line-height:1.55}

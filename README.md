@@ -35,10 +35,11 @@ Go 实现，编译为**单个静态二进制**，无运行时依赖；内置 **W
 - **三站点聚合**：单站点每日额度耗尽自动切换到其他站点的同款模型，额度耗尽的站点临时降级 10 分钟
 - **站点额度管理**：额度按访客身份按日计算，控制台站点卡片可一键查询当前额度、重置访客身份（等同新开隐私窗口、额度即刻回满）；请求撞额度时也会自动轮换访客身份恢复，无需重新求解
 - **代理线路**：主线路 + 多条备用线路，支持 `http://` `https://` `socks5://`；slow-start 检测 + 失败降级 + 流中失败不重放
+- **代理池**：Xray 核心（分享链接 / 订阅 / `ip:port` 端点；核心可自动下载）+ 粘性选路 + 后台健康探测；每个站点可绑定独立出口，Turnstile 求解与请求共用同一出口
 - **Turnstile 自动突破**：三种 Token 获取方式 — 求解服务 API（`provider="api"`）、本地浏览器自动求解（`provider="browser"`，CDP 直连 Chrome/Edge，无需 Playwright/Docker）、手动导入 Cookie（`provider="manual"`）；结果按「代理线路 × 站点」缓存，TTL 过期自动重解
 - **会话自愈**：nonce / data-config 缓存 + 配额耗尽 / 验证失败时自动刷新重试
 - **Web 管理台**：仪表盘、模型与站点、API Key、代理线路、Turnstile、对话调试、实时日志、设置
-- **可观测**：按模型 / 站点 / 按日统计、P50/P95 延迟、最近请求、实时日志（SSE），数据持久化到 `data/`
+- **可观测**：按模型 / 站点 / 按日统计、P50/P95 延迟、最近请求、实时日志（SSE）、文件日志按日压缩轮转，数据持久化到 `data/`
 - **安全**：下游 Bearer / `X-Api-Key` 鉴权、每 Key 每分钟限流、每站点并发闸门、管理台独立口令
 
 ---
@@ -134,14 +135,16 @@ dsfree2api -config config.toml -check
 
 | 字段 | 说明 |
 |------|------|
-| `[server]` | API 监听 `host` / `port` / `log_level` |
+| `[server]` | API 监听 `host` / `port` / `log_level` / `log_file`（留空写数据目录，按日压缩轮转；`-` = 仅终端） |
 | `[security].api_keys` | 下游鉴权，空数组 = 不鉴权 |
 | `[admin]` | 管理台 `enabled` / `host` / `port` / `password`（留空启动时生成随机密码） |
 | `[limits]` | `max_concurrent_per_site` 每站点并发、`rate_per_minute` 每 Key 每分钟限流（0 = 不限） |
 | `[proxy]` | `url` 主线路、`fallback_urls` 备用线路、`slow_start_seconds` 首事件超时 |
+| `[proxypool]` | 代理池总开关、健康检查间隔 / 超时 / URL、裸 `ip:port` 默认协议、Xray 路径 / 版本 / 自动下载；`[proxypool.entries.*]` 手动节点（分享链接或端点）、`[proxypool.subscriptions.*]` 订阅自动拉取 |
+| `[quota]` | 配额哨兵：`enabled` / `check_seconds` / `warn_ratio`，定期用池内会话读取站点免费额度，低额告警与重置留档 |
 | `[upstream]` | 超时、配置缓存 TTL、会话自动刷新、`cross_site_failover` 跨站切换、`continue_rounds` 工具调用截断续写轮数（0 = 不续写、直接截断补全） |
-| `[turnstile]` | **默认 `enabled = false` 且不内置任何求解服务**；`provider` 三选一：`api`（填 `api_url` / `api_key`）、`browser`（填 `browser_path` 指向本机 Chrome/Edge）、`manual`（只用控制台导入的 Cookie），另有 Cookie TTL、重试次数 |
-| `[sites.*]` | 三个站点的 `base_url` / `ajax_url` / `sitekey` / `language` |
+| `[turnstile]` | **默认 `enabled = false` 且不内置任何求解服务**；`provider` 三选一：`api`（填 `api_url` / `api_key`）、`browser`（填 `browser_path` 指向本机 Chrome/Edge）、`manual`（只用控制台导入的 Cookie），另有 Cookie TTL、重试次数、单次求解超时（`timeout_seconds`）、求解服务风格（`api_style`）与 Cookie 池（`warm_enabled` / `warm_ratio` / `warm_check_seconds`，后台预热，请求零等待） |
+| `[sites.*]` | 三个站点的 `base_url` / `ajax_url` / `sitekey` / `language` / `proxies`（站点级出口绑定，按顺序粘性选路）/ `warm_pool_only`（只预热池绑定线路） |
 | `[models.*]` | 模型到 `site` + `upstream_id` + `bot_id` / `post_id` 的映射 |
 
 ### Turnstile 说明
@@ -154,6 +157,7 @@ dsfree2api -config config.toml -check
 | `browser` | 2 · 本地浏览器自动获取 | `browser_path` | CDP 直连你配置的 Chrome / Edge：打开站点 → 注入 Turnstile widget → 可信点击 → 轮询拿到 Token；等价于 heartmore/cloudflare-solver 的做法，但**无需 Playwright / FlareSolverr / Docker**，单二进制即可。可选 `browser_user_data_dir`（真实 profile）、`browser_timezone` / `browser_locale`（对齐代理出口） |
 | `manual` | 3 · 手动导入 Cookie | — | 不自动求解，只使用控制台导入的 Cookie |
 
+- **求解服务风格**：`api_style = "ezsolver"` 时兼容本地 EzSolver 形态的求解服务（`{sitekey,siteurl,timeout}` → `{token}`），`api_key` 可留空；环回 / 内网求解地址直连（不随 `[proxy]` 线路，避免 `127.0.0.1` 被解析到隧道另一侧）；
 - **手动导入 Cookie**：在走同一条出口线路的浏览器里过一次验证，把 `document.cookie` 粘到控制台 **Turnstile → 手动导入 Cookie**，在 `cookie_ttl_seconds` 内免求解（Cookie 与出口 IP / UA 绑定，换线路需重新导入）；
 - **浏览器模式提示**：求解期间会短暂弹出浏览器窗口（`browser_headless = true` 可关闭，但过验证率更低）；带账号密码的代理暂不支持 Chrome，请用 IP 白名单代理；浏览器被系统策略锁定时会报 `browser launch failed` 并附 stderr。
 
@@ -265,8 +269,8 @@ curl http://127.0.0.1:8000/v1/messages \
 | 仪表盘 | 请求数 / 错误 / Token / P50·P95、模型用量、站点状态（含 Cookie TTL 进度条）、最近请求 |
 | 模型与站点 | 编辑标签、路径、bot_id/post_id，启停模型与站点，修改站点 URL / 语言 |
 | API Key | 生成 / 删除 / 复制下游 key，立即写回配置 |
-| 代理线路 | 主线路、备用线路增删、连通性测试、slow-start / 并发 / 限流 / 跨站切换 |
-| Turnstile | 三种 Token 获取方式的模式面板（求解服务 API / 本地浏览器自动获取 / 手动导入 Cookie）、各站 Cookie 状态与 TTL、强制刷新、求解历史 |
+| 代理线路 | 主线路、备用线路增删、连通性测试、slow-start / 并发 / 限流 / 跨站切换、代理池（节点 / 订阅 / 每站点绑定 / Xray 核心状态） |
+| Turnstile | 三种 Token 获取方式的模式面板（求解服务 API / 本地浏览器自动获取 / 手动导入 Cookie）、求解器风格（`api_style`）、各站 Cookie 状态与 TTL、Cookie 池预热状态、强制刷新、求解历史 |
 | 对话调试 | 选模型 / 系统提示 / tools JSON，流式或非流式，带连接计时与取消 |
 | 实时日志 | 级别过滤 + SSE 实时推送 |
 | 设置 | 服务与上游参数、数据目录、危险操作 |
@@ -283,6 +287,7 @@ curl http://127.0.0.1:8000/v1/messages \
 |------|------|------|
 | `HOST` / `PORT` | API 监听地址 | `0.0.0.0` / `8000` |
 | `LOG_LEVEL` | `DEBUG` `INFO` `WARN` `ERROR` | `INFO` |
+| `LOG_FILE` | 日志文件路径；留空 = `<data_dir>/logs/dsfree2api.log`，`-` = 仅终端 | —（文件日志） |
 | `API_KEYS` | 下游 key，逗号分隔 | —（不鉴权） |
 | `PROXY_URL` | 主代理 | —（直连） |
 | `PROXY_FALLBACK_URLS` | 备用代理，逗号分隔 | — |
@@ -291,6 +296,10 @@ curl http://127.0.0.1:8000/v1/messages \
 | `TURNSTILE_API_KEY` | Turnstile 求解服务 key（仅在 `provider=api` 且开启时校验） | 配置文件 |
 | `TURNSTILE_PROVIDER` | Token 获取方式：`api` / `browser` / `manual` | `api` |
 | `TURNSTILE_BROWSER_PATH` | 浏览器模式的 Chrome / Edge 可执行文件路径 | — |
+| `TURNSTILE_TIMEOUT_SECONDS` | 单次求解超时秒数（5–600） | `90` |
+| `TURNSTILE_WARM_ENABLED` | Cookie 池后台预热开关 | `false` |
+| `TURNSTILE_WARM_RATIO` | 剩余 TTL 低于该比例时自动续期（0–1） | `0.3` |
+| `TURNSTILE_WARM_CHECK_SECONDS` | 预热巡检间隔秒数（5–3600） | `60` |
 | `ADMIN_ENABLED` / `ADMIN_HOST` / `ADMIN_PORT` / `ADMIN_PASSWORD` | 管理台 | `true` / `127.0.0.1` / `8001` |
 | `DATA_DIR` | 统计等运行时数据目录 | `./data` |
 
@@ -302,15 +311,18 @@ curl http://127.0.0.1:8000/v1/messages \
 cmd/dsfree2api        入口：配置加载、日志、双 HTTP server、优雅退出
 internal/config       TOML 结构 + 默认值 + env 覆盖 + 校验 + 写回
 internal/httpx        TLS 指纹会话封装（bogdanfinn/tls-client, Chrome_120）
+internal/proxypool    代理池：Xray 核心管理 / 订阅拉取 / 分享链接解析 / 粘性选路与健康探测
+internal/quota        配额哨兵：站点余额轮询 / 低额告警 / 重置留档
 internal/openai       OpenAI 协议类型、prompt 拼接、tool_calls 解析
 internal/anthropic    Anthropic Messages 协议类型 + 与 OpenAI 消息的互转
-internal/turnstile    Turnstile 三种求解方式（API / 浏览器 CDP / 手动）+ 按线路/站点的 Cookie 缓存
+internal/turnstile    Turnstile 三种求解方式（API / 浏览器 CDP / 手动）+ 按线路/站点的 Cookie 缓存与后台预热（warmer）
 internal/upstream     上游逆向核心：data-config/nonce → SSE → 事件翻译，
                       线路降级、慢启动、会话刷新、跨站切换
 internal/api          OpenAI / Anthropic 路由、鉴权、限流、流式写出
 internal/admin        管理台后端 + go:embed 前端
 internal/metrics      计数/分模型/分站点/按日/延迟分位数，JSON 持久化
 internal/logbuf       环形日志 + 订阅广播（供 SSE 日志页）
+internal/logfile      文件日志：按日轮转 + gzip 归档（`[server].log_file`）
 ```
 
 ---
