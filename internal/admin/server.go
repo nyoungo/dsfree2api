@@ -22,7 +22,7 @@ import (
 )
 
 // Version is reported by the console and /api/overview.
-var Version = "0.6.1"
+var Version = "0.6.2"
 
 //go:embed web/*
 var webFS embed.FS
