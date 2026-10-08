@@ -11,12 +11,14 @@ import (
 	"html"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nyoungo/dsfree2api/internal/config"
 	"github.com/nyoungo/dsfree2api/internal/httpx"
@@ -65,7 +67,7 @@ type Client struct {
 	stateMu  sync.Mutex
 	chatCfg  map[string]chatConfig
 	cfgLocks map[string]*sync.Mutex
-	gates    map[string]chan struct{}
+	gates    map[string]*siteGate
 
 	// quotaCool marks sites that recently answered with quota errors; they
 	// are tried after the healthy mirrors until the cooldown expires.
@@ -96,7 +98,7 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger, pool RouteS
 		pool:      pool,
 		chatCfg:   map[string]chatConfig{},
 		cfgLocks:  map[string]*sync.Mutex{},
-		gates:     map[string]chan struct{}{},
+		gates:     map[string]*siteGate{},
 		quotaCool: map[string]time.Time{},
 	}
 }
@@ -156,15 +158,14 @@ func (c *Client) quotaCooled(code string) bool {
 // the transition, not every probe that confirms it.
 func (c *Client) setQuotaCool(code string) {
 	c.stateMu.Lock()
-	until, ok := c.quotaCool[code]
-	now := time.Now()
-	if ok && now.Add(quotaCoolTTL).Before(until) {
-		c.stateMu.Unlock()
-		return
-	}
-	c.quotaCool[code] = now.Add(quotaCoolTTL)
+	_, wasCooled := c.quotaCool[code]
+	// 每次都把截止时间顺延，重复探测只延长窗口；只有从"未冷却"进入
+	// "冷却"这一次状态翻转才记 INFO，之后的确认探测不再刷日志。
+	c.quotaCool[code] = time.Now().Add(quotaCoolTTL)
 	c.stateMu.Unlock()
-	c.log.Info("site quota cooldown", "site", code, "for", quotaCoolTTL)
+	if !wasCooled {
+		c.log.Info("site quota cooldown", "site", code, "for", quotaCoolTTL)
+	}
 }
 
 // sortQuotaCoolLast moves quota-cooled sites behind the healthy candidates,
@@ -738,7 +739,7 @@ func (c *Client) chatOnce(
 	headers := ajaxHeaders(site, referer, ua)
 	headers["Accept"] = "text/event-stream"
 
-	rc, _, err := sess.Stream(streamCtx, httpx.Request{
+	rc, status, err := sess.Stream(streamCtx, httpx.Request{
 		Method: "GET",
 		URL:    cc.AJAXURL + "?" + params,
 		Header: headers,
@@ -747,7 +748,7 @@ func (c *Client) chatOnce(
 		if streamCtx.Err() != nil && ctx.Err() == nil {
 			return errf("upstream stream timeout: %v", err)
 		}
-		return AsUpstream(err)
+		return streamHTTPError(status, err)
 	}
 	defer rc.Close()
 
@@ -770,6 +771,18 @@ func (c *Client) chatOnce(
 		}
 		return nil
 	})
+}
+
+// streamHTTPError classifies a stream setup failure by its HTTP status. 401/403
+// mean the cached session is no longer accepted (expired nonce / Turnstile
+// cookie), which must be reported as a session error so the caller refreshes
+// cookies instead of blaming the egress endpoint (poolReport(false)) and
+// keeping the stale cookie.
+func streamHTTPError(status int, err error) error {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return newSession(fmt.Sprintf("upstream stream http %d: %v", status, err))
+	}
+	return AsUpstream(err)
 }
 
 // sseTimingReader (diagnosis only, gated by DSFREE_SSE_TIMING) logs when bytes
@@ -997,25 +1010,51 @@ func (c *Client) lockFor(key string) *sync.Mutex {
 
 // ── concurrency gate ────────────────────────────────────────────
 
+// siteGate 是单个站点的并发闸门。名额用 busy 计数而不是"首次使用时定容的
+// channel"，这样 [limits].max_concurrent_per_site 被修改后立即生效，无需重启
+// （channel 版本只在第一次 acquire 时定容，之后改配置一直不生效）。
+type siteGate struct {
+	mu   sync.Mutex
+	busy int
+	// wake 在每次 release 时被关闭并重建，用来广播唤醒等待者；等待者醒来后
+	// 按当时最新的配置重新竞争名额。
+	wake chan struct{}
+}
+
+func newSiteGate() *siteGate { return &siteGate{wake: make(chan struct{})} }
+
 func (c *Client) acquire(ctx context.Context, site string) error {
-	c.cfg.RLock()
-	max := c.cfg.Limits.MaxConcurrentPerSite
-	c.cfg.RUnlock()
-	if max <= 0 {
-		return nil
-	}
 	c.stateMu.Lock()
 	g, ok := c.gates[site]
 	if !ok {
-		g = make(chan struct{}, max)
+		g = newSiteGate()
 		c.gates[site] = g
 	}
 	c.stateMu.Unlock()
-	select {
-	case g <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("site %s busy: %w", site, ctx.Err())
+	return c.admit(ctx, site, g)
+}
+
+// admit 在当前配置的上限内占一个名额；超限时阻塞到有空位或 ctx 结束。
+func (c *Client) admit(ctx context.Context, site string, g *siteGate) error {
+	for {
+		c.cfg.RLock()
+		max := c.cfg.Limits.MaxConcurrentPerSite
+		c.cfg.RUnlock()
+
+		g.mu.Lock()
+		if max <= 0 || g.busy < max {
+			g.busy++
+			g.mu.Unlock()
+			return nil
+		}
+		wake := g.wake
+		g.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("site %s busy: %w", site, ctx.Err())
+		case <-wake:
+		}
 	}
 }
 
@@ -1026,10 +1065,13 @@ func (c *Client) release(site string) {
 	if !ok {
 		return
 	}
-	select {
-	case <-g:
-	default:
+	g.mu.Lock()
+	if g.busy > 0 {
+		g.busy--
 	}
+	close(g.wake)
+	g.wake = make(chan struct{})
+	g.mu.Unlock()
 }
 
 // ── helpers ─────────────────────────────────────────────────────
@@ -1120,6 +1162,10 @@ func itoa64(v int64) string { return fmt.Sprintf("%d", v) }
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// 按字节截断可能切碎多字节字符，回退到字符边界，避免产出非法 UTF-8。
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }

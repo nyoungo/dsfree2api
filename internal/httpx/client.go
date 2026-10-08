@@ -6,6 +6,7 @@ package httpx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -21,6 +23,35 @@ import (
 
 // DefaultUserAgent mirrors config.DefaultUserAgent without an import cycle.
 const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+
+// DefaultProfile 返回出站连接使用的 TLS/HTTP2 指纹档案。必须与
+// DefaultUserAgent 保持同一代际：JA3 指纹说 Chrome/120、UA 却说
+// Chrome/149，属于自相矛盾的客户端特征，容易被上游当成异常流量。
+func DefaultProfile() profiles.ClientProfile {
+	return profiles.Chrome_150
+}
+
+// DefaultMaxBodyBytes 非流式响应体的默认读取上限。上游（或中间人）发一个
+// 无限大的 body 时，io.ReadAll 会把网关内存直接吃光。
+const DefaultMaxBodyBytes int64 = 64 << 20
+
+// ErrBodyTooLarge 响应体超过读取上限时返回（原样透出，方便上层判断）。
+var ErrBodyTooLarge = errors.New("response body exceeds the configured limit")
+
+// readLimited 读满上限即报错，不把超限部分继续吞进内存。
+func readLimited(r io.Reader, max int64) ([]byte, error) {
+	if max <= 0 {
+		max = DefaultMaxBodyBytes
+	}
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, ErrBodyTooLarge
+	}
+	return b, nil
+}
 
 type Request struct {
 	Method  string
@@ -49,6 +80,8 @@ type Session interface {
 type Options struct {
 	ProxyURL string
 	Timeout  time.Duration
+	// MaxBodyBytes 非流式响应体读取上限，0 = DefaultMaxBodyBytes。
+	MaxBodyBytes int64
 }
 
 type tlsSession struct {
@@ -57,6 +90,8 @@ type tlsSession struct {
 	mu      sync.Mutex
 	cookies map[string]string
 	closed  bool
+
+	maxBody int64
 }
 
 // NewSession builds a Chrome-impersonating session.
@@ -66,7 +101,7 @@ func NewSession(opts Options) (Session, error) {
 		timeout = 60 * time.Second
 	}
 	tlsOpts := []tls_client.HttpClientOption{
-		tls_client.WithClientProfile(profiles.Chrome_120),
+		tls_client.WithClientProfile(DefaultProfile()),
 		tls_client.WithTimeoutSeconds(int(timeout.Seconds()) + 1),
 		tls_client.WithRandomTLSExtensionOrder(),
 	}
@@ -80,6 +115,7 @@ func NewSession(opts Options) (Session, error) {
 	return &tlsSession{
 		inner:   inner,
 		cookies: map[string]string{},
+		maxBody: opts.MaxBodyBytes,
 	}, nil
 }
 
@@ -204,7 +240,7 @@ func (s *tlsSession) Do(ctx context.Context, r Request) (*Response, error) {
 	}
 	defer resp.Body.Close()
 	s.capture(resp)
-	body, err := io.ReadAll(resp.Body)
+	body, err := readLimited(resp.Body, s.maxBody)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
@@ -227,7 +263,7 @@ func (s *tlsSession) Stream(ctx context.Context, r Request) (io.ReadCloser, int,
 	}
 	s.capture(resp)
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := readLimited(resp.Body, s.maxBody)
 		resp.Body.Close()
 		return nil, resp.StatusCode, fmt.Errorf("upstream status %d: %s", resp.StatusCode, truncate(string(body), 400))
 	}
@@ -237,6 +273,10 @@ func (s *tlsSession) Stream(ctx context.Context, r Request) (io.ReadCloser, int,
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// 按字节截断可能切碎多字节字符，回退到字符边界，避免产出非法 UTF-8。
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }

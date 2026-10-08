@@ -65,6 +65,13 @@ type Manager struct {
 	started   bool
 	lastCheck time.Time
 	lastErr   string
+
+	// 关闭协调：stopCh 通知循环退出，doneCh 在循环真正退出后关闭，
+	// loopCancel 取消 Start 传入的 ctx（让进行中的 cycle 立刻收尾）。
+	stopCh     chan struct{}
+	doneCh     chan struct{}
+	loopCancel context.CancelFunc
+	closeOnce  sync.Once
 }
 
 func New(cfg *config.Config, dataDir string, log *slog.Logger) *Manager {
@@ -80,6 +87,8 @@ func New(cfg *config.Config, dataDir string, log *slog.Logger) *Manager {
 		subs:      map[string]*subState{},
 		sticky:    map[string]string{},
 		fetching:  map[string]bool{},
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
 	}
 }
 
@@ -92,16 +101,44 @@ func (m *Manager) Start(ctx context.Context) {
 		return
 	}
 	m.started = true
+	ctx, m.loopCancel = context.WithCancel(ctx)
 	m.mu.Unlock()
 	go m.loop(ctx)
 }
 
+// Close 停掉后台循环并同步回收 xray 子进程，阻塞到两件事都完成为止。
+// 进程退出路径必须调用它：仅靠 ctx 取消是异步的，主 goroutine 退出时
+// 循环可能还没跑到 xray.stop()，子进程会变成孤儿（Windows 上父进程退出
+// 不会带走子进程）。
+func (m *Manager) Close() {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		cancel := m.loopCancel
+		started := m.started
+		m.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		close(m.stopCh)
+		if !started {
+			// 循环没启动过，没有 doneCh 可等，直接回收。
+			m.xray.stop()
+			return
+		}
+		<-m.doneCh
+	})
+}
+
 func (m *Manager) loop(ctx context.Context) {
+	defer close(m.doneCh)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			m.xray.stop()
+			return
+		case <-m.stopCh:
 			m.xray.stop()
 			return
 		case <-ticker.C:
@@ -616,9 +653,20 @@ func (m *Manager) Status() Status {
 	m.cfg.RUnlock()
 
 	m.mu.Lock()
-	endpoints := make([]*endpoint, 0, len(m.endpoints))
+	// 在锁内把 endpoint 快照成值类型：检查循环/Report 会在 m.mu 下改
+	// ep.healthy/lastErr/latencyMs，锁外再读这些字段就是数据竞争。
+	entries := make([]EntryStatus, 0, len(m.endpoints))
 	for _, ep := range m.endpoints {
-		endpoints = append(endpoints, ep)
+		es := EntryStatus{
+			Name: ep.name, Kind: ep.kind, Scheme: ep.scheme, Target: ep.display,
+			Source: ep.source, Enabled: ep.enabled, Healthy: ep.healthy,
+			Checked: ep.checked, LatencyMs: ep.latencyMs, LastErr: ep.lastErr,
+			ParseError: ep.parseErr,
+		}
+		if !ep.checkedAt.IsZero() {
+			es.CheckedAt = ep.checkedAt.Unix()
+		}
+		entries = append(entries, es)
 	}
 	sticky := make(map[string]string, len(m.sticky))
 	for k, v := range m.sticky {
@@ -642,20 +690,9 @@ func (m *Manager) Status() Status {
 		XrayVersion:      poolCfg.XrayVersion,
 		XrayAutoDownload: poolCfg.XrayAutoDownload,
 		Xray:             m.xray.status(),
+		Entries:          entries,
 		Sticky:           sticky,
 		LastError:        lastErr,
-	}
-	for _, ep := range endpoints {
-		es := EntryStatus{
-			Name: ep.name, Kind: ep.kind, Scheme: ep.scheme, Target: ep.display,
-			Source: ep.source, Enabled: ep.enabled, Healthy: ep.healthy,
-			Checked: ep.checked, LatencyMs: ep.latencyMs, LastErr: ep.lastErr,
-			ParseError: ep.parseErr,
-		}
-		if !ep.checkedAt.IsZero() {
-			es.CheckedAt = ep.checkedAt.Unix()
-		}
-		st.Entries = append(st.Entries, es)
 	}
 	sort.Slice(st.Entries, func(i, j int) bool {
 		a, b := st.Entries[i], st.Entries[j]

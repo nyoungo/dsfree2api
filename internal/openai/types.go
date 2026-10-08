@@ -1,6 +1,9 @@
 package openai
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 type ChatMessage struct {
 	Role       string         `json:"role"`
@@ -67,6 +70,32 @@ type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
+// StopSequences 兼容 OpenAI 对 stop 的两种写法：单个字符串或字符串数组。
+// 直接用 []string 会让 `"stop": "END"` 这种合法请求整个解码失败（400）。
+type StopSequences []string
+
+func (s *StopSequences) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*s = nil
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(data, &one); err == nil {
+		if one == "" {
+			*s = nil
+		} else {
+			*s = StopSequences{one}
+		}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(data, &many); err != nil {
+		return fmt.Errorf("stop must be a string or an array of strings")
+	}
+	*s = many
+	return nil
+}
+
 type ChatCompletionRequest struct {
 	Model            string          `json:"model"`
 	Messages         []ChatMessage   `json:"messages"`
@@ -78,7 +107,7 @@ type ChatCompletionRequest struct {
 	Tools            []ToolDef       `json:"tools,omitempty"`
 	ToolChoice       json.RawMessage `json:"tool_choice,omitempty"`
 	User             string          `json:"user,omitempty"`
-	Stop             []string        `json:"stop,omitempty"`
+	Stop             StopSequences   `json:"stop,omitempty"`
 	ResponseFormat   *ResponseFormat `json:"response_format,omitempty"`
 	StreamOptions    *StreamOptions  `json:"stream_options,omitempty"`
 	N                *int            `json:"n,omitempty"`
@@ -132,6 +161,15 @@ type ResponsesRequest struct {
 	MaxOutputTokens *int            `json:"max_output_tokens,omitempty"`
 	Tools           []ResponsesTool `json:"tools,omitempty"`
 	ToolChoice      json.RawMessage `json:"tool_choice,omitempty"`
+	// Text 是 Responses API 的输出配置块，text.format 承载输出格式约束
+	// （json_schema / json_object / text）。不解析它，客户端指定的
+	// json_schema 会被静默丢弃，模型输出的 JSON 无从校验。
+	Text *TextFormat `json:"text,omitempty"`
+}
+
+// TextFormat 是 Responses API 的 text 对象，这里只消费 format。
+type TextFormat struct {
+	Format *ResponseFormat `json:"format,omitempty"`
 }
 
 // ResponsesTool is a function tool in the flat Responses API shape; the nested

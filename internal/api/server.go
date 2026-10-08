@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -183,16 +184,45 @@ func (s *Server) logRequest(next http.Handler) http.Handler {
 
 func (s *Server) recoverPanic(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tw := &headerTracker{ResponseWriter: w}
 		defer func() {
 			if rec := recover(); rec != nil {
 				s.log.Error("panic", "err", rec, "stack", string(debug.Stack()))
-				writeJSON(w, http.StatusInternalServerError, map[string]any{
-					"error": map[string]any{"message": "internal server error", "type": "server_error"},
-				})
+				// 响应头已经发出去（SSE 已开流）就不能再改状态码：硬写 500
+				// 只会把错误 JSON 拼进事件流，客户端解析流会直接失败。
+				if !tw.wroteHeader {
+					writeJSON(tw, http.StatusInternalServerError, map[string]any{
+						"error": map[string]any{"message": "internal server error", "type": "server_error"},
+					})
+				}
 			}
 		}()
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(tw, r)
 	})
+}
+
+// headerTracker 记录响应头是否已发出，并把 Flush 透传给底层 writer。
+type headerTracker struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *headerTracker) WriteHeader(code int) {
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *headerTracker) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *headerTracker) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 type statusWriter struct {
@@ -223,6 +253,31 @@ func writeError(w http.ResponseWriter, code int, msg, typ string) {
 	writeJSON(w, code, map[string]any{
 		"error": map[string]any{"message": msg, "type": typ},
 	})
+}
+
+// maxRequestBodyBytes caps every public endpoint's body: these endpoints are
+// unauthenticated when api_keys is empty, so an uncapped body would let one
+// client pin a connection and allocate without bound.
+const maxRequestBodyBytes = 8 << 20
+
+type errorWriter func(w http.ResponseWriter, code int, msg, typ string)
+
+// decodeBody caps the request body before JSON-decoding it and reports any
+// failure through the caller's error shape (OpenAI vs Anthropic). It returns
+// false after having written the error response.
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any, fail errorWriter) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err == nil {
+		return true
+	}
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		fail(w, http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error")
+		return false
+	}
+	fail(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error")
+	return false
 }
 
 func sortModelInfo(data []map[string]any) {

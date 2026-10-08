@@ -16,8 +16,7 @@ import (
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	var req anthropic.Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error")
+	if !decodeBody(w, r, &req, writeAnthropicError) {
 		return
 	}
 	if req.Model == "" {
@@ -128,17 +127,6 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 	}
 
 	msgID := anthropic.NewID("msg_")
-	_ = writeEvent("message_start", map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id": msgID, "type": "message", "role": "assistant", "model": req.Model,
-			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]any{
-				"input_tokens":  estimateUsage(prompt, "").PromptTokens,
-				"output_tokens": 0,
-			},
-		},
-	})
 
 	// With tools the raw tool-call JSON is converted into streamed tool_use
 	// blocks: content_block_start once id+name are known, then one
@@ -147,11 +135,36 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 	if len(tools) > 0 {
 		args = openai.NewArgStreamer()
 	}
-	if args == nil {
-		_ = writeEvent("content_block_start", map[string]any{
-			"type": "content_block_start", "index": 0,
-			"content_block": map[string]any{"type": "text", "text": ""},
-		})
+
+	// The opening events are held back until the upstream produces output:
+	// that keeps the HTTP status free for a failure with nothing streamed yet,
+	// exactly like the non-streaming path.
+	var started bool
+	beginStream := func() error {
+		if started {
+			return nil
+		}
+		started = true
+		if err := writeEvent("message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": msgID, "type": "message", "role": "assistant", "model": req.Model,
+				"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+				"usage": map[string]any{
+					"input_tokens":  estimateUsage(prompt, "").PromptTokens,
+					"output_tokens": 0,
+				},
+			},
+		}); err != nil {
+			return err
+		}
+		if args == nil {
+			return writeEvent("content_block_start", map[string]any{
+				"type": "content_block_start", "index": 0,
+				"content_block": map[string]any{"type": "text", "text": ""},
+			})
+		}
+		return nil
 	}
 
 	// Anthropic content blocks are strictly sequential: close the open
@@ -169,6 +182,9 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 	onToolDelta := func(d openai.ToolArgDelta) error {
 		if d.Index < curIdx {
 			return nil
+		}
+		if err := beginStream(); err != nil {
+			return err
 		}
 		if d.ID != "" {
 			ids[d.Index] = d.ID
@@ -234,6 +250,9 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 			firstDelta = time.Now()
 		}
 	}, func(seg string) error {
+		if err := beginStream(); err != nil {
+			return err
+		}
 		text.WriteString(seg)
 		if args == nil {
 			return writeEvent("content_block_delta", map[string]any{
@@ -264,6 +283,12 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 			Status:       metrics.StatusError, Error: err.Error(),
 		})
 		s.log.Warn("messages stream error", "model", req.Model, "error", err)
+		if !started {
+			// nothing on the wire yet — report a real status like the
+			// non-streaming path does
+			writeAnthropicUpstreamError(w, err)
+			return
+		}
 		writeErr("api_error", err.Error())
 		return
 	}
@@ -272,7 +297,16 @@ func (s *Server) streamMessages(ctx context.Context, w http.ResponseWriter, req 
 			Model: req.Model, ServedBy: servedBy, Site: servedSite, Stream: true,
 			DurationMs: duration.Milliseconds(), Status: metrics.StatusEmpty, Error: "empty response",
 		})
+		if !started {
+			writeAnthropicError(w, http.StatusInternalServerError, emptyResponseMessage, "api_error")
+			return
+		}
 		writeErr("api_error", emptyResponseMessage)
+		return
+	}
+
+	// Success: the opening events must precede every event below.
+	if err := beginStream(); err != nil {
 		return
 	}
 

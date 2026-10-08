@@ -30,6 +30,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "messages is required", "invalid_request_error")
 		return
 	}
+	// 网关一次只回 1 条 choice；n>1 若静默忽略，客户端会以为拿到了
+	// n 条候选 —— 明确拒绝。校验要排在模型查找之前。
+	if req.N != nil && *req.N > 1 {
+		writeError(w, http.StatusBadRequest,
+			"n > 1 is not supported: this gateway returns a single choice",
+			"invalid_request_error")
+		return
+	}
 	s.cfg.RLock()
 	m, ok := s.cfg.Models[req.Model]
 	site := ""
@@ -148,7 +156,8 @@ func (s *Server) completeChat(ctx context.Context, w http.ResponseWriter, req op
 }
 
 func buildCompletion(req openai.ChatCompletionRequest, prompt, body string) *openai.ChatCompletionResponse {
-	message := openai.ChoiceMessage{Content: body}
+	// Role 的 json tag 没有 omitempty，漏设会返回空串；与流式路径保持一致。
+	message := openai.ChoiceMessage{Role: "assistant", Content: body}
 	if len(req.Tools) > 0 {
 		remaining, calls, ok := openai.TryParseToolCalls(body)
 		if ok {
@@ -233,8 +242,8 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
 
 	_ = write(chunk(openai.ChoiceDelta{Role: "assistant"}, nil))
 
-	s.met.IncInFlight(1)
-	defer s.met.IncInFlight(-1)
+	// in_flight 由 handleChat 统一计一次，streamChat 不再重复计数，
+	// 否则控制台的并发数会按 2 倍显示。
 
 	err := s.chatWithContinue(ctx, req.Model, prompt, cont, info, func() {
 		if firstDelta.IsZero() {

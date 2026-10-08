@@ -13,10 +13,38 @@ import (
 	"github.com/nyoungo/dsfree2api/internal/upstream"
 )
 
+// responsesUsage renders token usage with the Responses API field names
+// (input_tokens/output_tokens/total_tokens). Reusing the Chat Completions
+// shape here would leave every client's response.usage.input_tokens as null.
+func responsesUsage(u openai.Usage) map[string]any {
+	return map[string]any{
+		"input_tokens":  u.PromptTokens,
+		"output_tokens": u.CompletionTokens,
+		"total_tokens":  u.TotalTokens,
+	}
+}
+
+// responsesPromptOptions 把 Responses 请求翻译成 BuildPrompt 选项。
+// text.format 里的输出格式约束必须带过去 —— 与 Chat Completions 的
+// response_format 等价，漏掉它客户端的 json_schema 就是静默失效。
+func responsesPromptOptions(req *openai.ResponsesRequest, tools []openai.ToolDef) openai.PromptOptions {
+	var rf *openai.ResponseFormat
+	if req.Text != nil {
+		rf = req.Text.Format
+	}
+	return openai.PromptOptions{
+		Tools:          tools,
+		ToolChoice:     req.ToolChoice,
+		Temperature:    req.Temperature,
+		TopP:           req.TopP,
+		MaxTokens:      req.MaxOutputTokens,
+		ResponseFormat: rf,
+	}
+}
+
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var req openai.ResponsesRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error")
+	if !decodeBody(w, r, &req, writeError) {
 		return
 	}
 	messages, err := openai.ResponsesToMessages(&req)
@@ -43,13 +71,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt := openai.BuildPrompt(messages, openai.PromptOptions{
-		Tools:       tools,
-		ToolChoice:  req.ToolChoice,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		MaxTokens:   req.MaxOutputTokens,
-	})
+	prompt := openai.BuildPrompt(messages, responsesPromptOptions(&req, tools))
 
 	s.met.IncInFlight(1)
 	defer s.met.IncInFlight(-1)
@@ -86,7 +108,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"output":      output,
 		"output_text": text,
 		"stop_reason": stopReason,
-		"usage":       out.usage,
+		"usage":       responsesUsage(out.usage),
 	})
 }
 
@@ -142,12 +164,22 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 		return nil
 	}
 
-	_ = write(map[string]any{
-		"type": "response.created",
-		"response": map[string]any{
-			"id": id, "model": req.Model, "status": "in_progress", "created_at": time.Now().Unix(),
-		},
-	})
+	// The created event is held back until the upstream produces output, so a
+	// failure with nothing streamed yet can still use a real HTTP status
+	// instead of a failed event inside an already-200 stream.
+	var started bool
+	beginStream := func() error {
+		if started {
+			return nil
+		}
+		started = true
+		return write(map[string]any{
+			"type": "response.created",
+			"response": map[string]any{
+				"id": id, "model": req.Model, "status": "in_progress", "created_at": time.Now().Unix(),
+			},
+		})
+	}
 
 	// With tools the raw tool-call JSON is converted into a live
 	// function_call item stream: output_item.added once id+name are known,
@@ -199,6 +231,9 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 	onToolDelta := func(d openai.ToolArgDelta) error {
 		if d.Index < openIdx {
 			return nil // models emit calls in order — drop stale index
+		}
+		if err := beginStream(); err != nil {
+			return err
 		}
 		if d.ID != "" {
 			callIDs[d.Index] = d.ID
@@ -259,6 +294,9 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 			firstDelta = time.Now()
 		}
 	}, func(seg string) error {
+		if err := beginStream(); err != nil {
+			return err
+		}
 		text.WriteString(seg)
 		if args == nil {
 			return write(map[string]any{"type": "response.output_text.delta", "delta": seg})
@@ -285,6 +323,12 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 			Status: metrics.StatusError, Error: err.Error(),
 		})
 		// Never report a failed stream as completed.
+		if !started {
+			// nothing on the wire yet — report a real status like the
+			// non-streaming path does
+			writeUpstreamError(w, err)
+			return
+		}
 		_ = write(map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
@@ -303,6 +347,10 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 			Model: req.Model, ServedBy: servedBy, Site: servedSite, Stream: true,
 			DurationMs: duration.Milliseconds(), Status: metrics.StatusEmpty, Error: "empty response",
 		})
+		if !started {
+			writeError(w, http.StatusBadGateway, emptyResponseMessage, "upstream_empty_response")
+			return
+		}
 		_ = write(map[string]any{
 			"type": "response.failed",
 			"response": map[string]any{
@@ -314,6 +362,11 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 		if flusher != nil {
 			flusher.Flush()
 		}
+		return
+	}
+
+	// Success: response.created must precede every event below.
+	if err := beginStream(); err != nil {
 		return
 	}
 
@@ -420,7 +473,7 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, req
 		"type": "response.completed",
 		"response": map[string]any{
 			"id": id, "model": req.Model, "status": "completed", "created_at": time.Now().Unix(),
-			"output": output, "stop_reason": stopReason, "usage": usage,
+			"output": output, "stop_reason": stopReason, "usage": responsesUsage(usage),
 		},
 	})
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")

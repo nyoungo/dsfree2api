@@ -198,21 +198,27 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		s.save(w)
 
 	case "set_limits":
+		// 部分更新：只覆盖 payload 里出现的字段，缺字段不能按零值写回，
+		// 否则一次只改 cross_site 的请求会把并发闸门（0 = 不限）和限流清零。
 		var p struct {
-			SlowStart      float64 `json:"slow_start"`
-			MaxConcurrent  int     `json:"max_concurrent"`
-			RatePerMinute  float64 `json:"rate_per_minute"`
-			CrossSite      *bool   `json:"cross_site_failover"`
-			AutoRefresh    *bool   `json:"auto_refresh"`
-			RefreshRetries *int    `json:"refresh_retries"`
+			SlowStart      *float64 `json:"slow_start"`
+			MaxConcurrent  *int     `json:"max_concurrent"`
+			RatePerMinute  *float64 `json:"rate_per_minute"`
+			CrossSite      *bool    `json:"cross_site_failover"`
+			AutoRefresh    *bool    `json:"auto_refresh"`
+			RefreshRetries *int     `json:"refresh_retries"`
 		}
 		_ = json.Unmarshal(body, &p)
 		s.cfg.Lock()
-		if p.SlowStart >= 0 {
-			s.cfg.Proxy.SlowStartSeconds = p.SlowStart
+		if p.SlowStart != nil && *p.SlowStart >= 0 {
+			s.cfg.Proxy.SlowStartSeconds = *p.SlowStart
 		}
-		s.cfg.Limits.MaxConcurrentPerSite = p.MaxConcurrent
-		s.cfg.Limits.RatePerMinute = p.RatePerMinute
+		if p.MaxConcurrent != nil {
+			s.cfg.Limits.MaxConcurrentPerSite = *p.MaxConcurrent
+		}
+		if p.RatePerMinute != nil {
+			s.cfg.Limits.RatePerMinute = *p.RatePerMinute
+		}
 		if p.CrossSite != nil {
 			s.cfg.Upstream.CrossSiteFailover = *p.CrossSite
 		}
@@ -227,7 +233,7 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 
 	case "set_turnstile":
 		var p struct {
-			Enabled   bool    `json:"enabled"`
+			Enabled   *bool   `json:"enabled"`
 			Provider  *string `json:"provider"`
 			APIURL    string  `json:"api_url"`
 			APIKey    string  `json:"api_key"`
@@ -309,7 +315,10 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		if p.WarmCheckSeconds != nil {
 			tc.WarmCheckSeconds = clampInt(*p.WarmCheckSeconds, 5, 3600)
 		}
-		tc.Enabled = p.Enabled
+		// 部分更新：payload 不带 enabled 时保持现状，不能把求解器关掉。
+		if p.Enabled != nil {
+			tc.Enabled = *p.Enabled
+		}
 		if tc.Enabled {
 			// provider-specific requirements mirror config.Validate()
 			switch tc.ProviderValue() {

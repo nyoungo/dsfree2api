@@ -65,14 +65,21 @@ func readSSE(r io.Reader, handle func(event string, dataLines []string) error) e
 // translateEvent converts one upstream SSE event into zero or more events for
 // the downstream client. It returns an error for upstream failure payloads.
 func translateEvent(eventType string, dataLines []string) ([]Event, error) {
-	var payload map[string]any
 	for _, line := range dataLines {
 		if line == "[DONE]" {
 			return []Event{{Kind: KindDone}}, nil
 		}
-		var p map[string]any
-		if err := json.Unmarshal([]byte(line), &p); err == nil {
-			payload = p
+	}
+	// SSE 规范：同一事件的多个 data 行用 "\n" 拼接才是完整负载，跨行 JSON
+	// 必须整条解析；逐行解析会把它丢掉。
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.Join(dataLines, "\n")), &payload); err != nil {
+		// 兼容上游偶尔夹带的非 JSON 行：退化为逐行解析，取最后一个能解析的。
+		for _, line := range dataLines {
+			var p map[string]any
+			if err := json.Unmarshal([]byte(line), &p); err == nil {
+				payload = p
+			}
 		}
 	}
 	if payload == nil {
@@ -176,7 +183,7 @@ func shortJSON(payload map[string]any) string {
 	}
 	s := string(raw)
 	if len(s) > 400 {
-		return s[:400] + "..."
+		return truncate(s, 400)
 	}
 	return s
 }

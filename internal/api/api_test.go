@@ -186,6 +186,29 @@ func anthropicErrType(body string) string {
 	return ""
 }
 
+// openaiErrType 解析 OpenAI 风格错误体 {"error":{"type":...}}。
+func openaiErrType(body string) string {
+	var out struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal([]byte(body), &out)
+	return out.Error.Type
+}
+
+// openaiErrMsg 取出 error.message（JSON 会把 ">" 转义成 >，
+// 所以断言文案必须走反序列化，不能拿原文子串匹配）。
+func openaiErrMsg(body string) string {
+	var out struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal([]byte(body), &out)
+	return out.Error.Message
+}
+
 func TestMessagesRequiresAuthInAnthropicFormat(t *testing.T) {
 	srv := newTestServer(t, nil)
 	resp, body := post(t, srv.URL+"/v1/messages", nil, `{}`)
@@ -232,5 +255,31 @@ func TestResponsesValidation(t *testing.T) {
 		`{"model":"no-such-model","input":"hi"}`)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown model status = %d body=%s, want 404", resp.StatusCode, body)
+	}
+}
+
+// 回归：n>1 必须 400 —— 网关只产 1 条 choice，静默忽略会让客户端以为
+// 拿到了 n 条候选。校验排在模型查找之前（模型不存在也先报参数错）。
+func TestChatRejectsNGreaterThanOne(t *testing.T) {
+	srv := newTestServer(t, nil)
+	h := map[string]string{"Authorization": "Bearer " + testKey, "Content-Type": "application/json"}
+
+	resp, body := post(t, srv.URL+"/v1/chat/completions", h,
+		`{"model":"no-such-model","messages":[{"role":"user","content":"hi"}],"n":2}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("n=2 status = %d body=%s, want 400", resp.StatusCode, body)
+	}
+	if !strings.Contains(openaiErrMsg(body), "n > 1") {
+		t.Errorf("error message should mention n > 1, body=%s", body)
+	}
+	if got := openaiErrType(body); got != "invalid_request_error" {
+		t.Errorf("error type = %q, want invalid_request_error; body=%s", got, body)
+	}
+
+	// n=1（含省略）照常放行到模型查找，返回 404
+	resp, body = post(t, srv.URL+"/v1/chat/completions", h,
+		`{"model":"no-such-model","messages":[{"role":"user","content":"hi"}],"n":1}`)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("n=1 status = %d body=%s, want 404", resp.StatusCode, body)
 	}
 }

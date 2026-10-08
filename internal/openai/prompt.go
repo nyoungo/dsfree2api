@@ -94,13 +94,38 @@ func samplingPrompt(opts PromptOptions) string {
 	if len(opts.Stop) > 0 {
 		add("- Stop sequences (do not emit them): %s", strings.Join(opts.Stop, " | "))
 	}
-	if opts.ResponseFormat != nil && opts.ResponseFormat.Type == "json_object" {
-		add("- Respond with a single valid JSON object only, no prose, no markdown fences.")
+	if opts.ResponseFormat != nil {
+		switch opts.ResponseFormat.Type {
+		case "json_object":
+			add("- Respond with a single valid JSON object only, no prose, no markdown fences.")
+		case "json_schema":
+			add("- Respond with a single valid JSON object only, no prose, no markdown fences.")
+			// schema 必须进入约束，否则声明的 json_schema 完全没生效，
+			// 客户端拿到的对象无法通过它自己的 schema 校验。
+			if schema := jsonSchemaConstraint(opts.ResponseFormat.JSONSchema); schema != "" {
+				add("- The JSON must validate against this JSON Schema: %s", schema)
+			}
+		}
 	}
 	if len(lines) == 0 {
 		return ""
 	}
 	return "=== GENERATION CONSTRAINTS ===\n" + strings.Join(lines, "\n") + "\n=== END GENERATION CONSTRAINTS ==="
+}
+
+// jsonSchemaConstraint 取出 response_format.json_schema 里的 schema 主体；
+// 结构不是预期形状时退回原始负载，至少让模型看到声明。
+func jsonSchemaConstraint(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var fs struct {
+		Schema json.RawMessage `json:"schema"`
+	}
+	if err := json.Unmarshal(raw, &fs); err == nil && len(fs.Schema) > 0 {
+		return string(fs.Schema)
+	}
+	return string(raw)
 }
 
 // ResponsesToMessages converts an OpenAI Responses API request into chat

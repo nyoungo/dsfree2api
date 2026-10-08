@@ -28,6 +28,13 @@ import (
 )
 
 func main() {
+	// 退出码交给 run 的返回值决定：所有清理都挂在 run 的 defer 上，任何
+	// 退出路径（含服务器启动失败）都会执行日志落盘、指标落盘和 xray 子
+	// 进程回收。直接 os.Exit 会跳过 defer，留下孤儿 xray。
+	os.Exit(run())
+}
+
+func run() int {
 	var (
 		configPath = flag.String("config", "config.toml", "path to config.toml")
 		host       = flag.String("host", "", "override bind host")
@@ -39,13 +46,13 @@ func main() {
 
 	if *showVer {
 		fmt.Printf("dsfree2api %s\n", admin.Version)
-		return
+		return 0
 	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	if *host != "" {
 		cfg.Server.Host = *host
@@ -55,17 +62,17 @@ func main() {
 	}
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "config invalid: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	if *checkOnly {
 		fmt.Println("config OK")
-		return
+		return 0
 	}
 
 	dataDir, err := cfg.DataDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot create data dir: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	level := parseLevel(cfg.Server.LogLevel)
@@ -85,10 +92,10 @@ func main() {
 
 	// Proxy pool: per-site egress endpoints (Xray share links, subscriptions,
 	// plain http/socks5) with sticky selection. No-op unless enabled.
+	// Close 会先停后台循环再同步杀掉 xray 子进程，确保进程退出前回收。
 	pool := proxypool.New(cfg, dataDir, logger)
-	poolCtx, poolCancel := context.WithCancel(context.Background())
-	defer poolCancel()
-	pool.Start(poolCtx)
+	pool.Start(context.Background())
+	defer pool.Close()
 
 	up := upstream.New(cfg, ts, logger, pool)
 
@@ -161,7 +168,7 @@ func main() {
 	select {
 	case err := <-errCh:
 		logger.Error("server failed", "error", err)
-		os.Exit(1)
+		return 1
 	case s := <-sig:
 		logger.Info("shutting down", "signal", s.String())
 	}
@@ -174,6 +181,7 @@ func main() {
 	}
 	met.Close()
 	logger.Info("bye")
+	return 0
 }
 
 // logSink opens the daily file log (default <data_dir>/logs/dsfree2api.log)

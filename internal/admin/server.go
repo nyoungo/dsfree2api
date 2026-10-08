@@ -202,6 +202,9 @@ func (s *Server) handleOverview(w http.ResponseWriter, _ *http.Request) {
 	}{s.cfg.Proxy.URL, s.cfg.Proxy.FallbackURLs, s.cfg.Proxy.SlowStartSeconds,
 		s.cfg.Limits.MaxConcurrentPerSite, s.cfg.Limits.RatePerMinute, s.cfg.Upstream.CrossSiteFailover}
 	turnstileCfg := s.cfg.Turnstile
+	// The console never renders the solver key (its field is "type to
+	// replace"), so it must not ship every 5s with the dashboard poll either.
+	turnstileCfg.APIKey = ""
 	keys := append([]string(nil), s.cfg.Security.APIKeys...)
 	s.cfg.RUnlock()
 
@@ -249,8 +252,27 @@ func routeList(c *upstream.Client) []map[string]string {
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	s.cfg.RLock()
-	defer s.cfg.RUnlock()
-	writeJSON(w, http.StatusOK, s.cfg)
+	raw, err := json.Marshal(s.cfg)
+	s.cfg.RUnlock()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	// The console never displays these two secrets (both inputs are "leave
+	// blank to keep"), so there is no reason to hand them out; an empty value
+	// round-tripping through PUT is interpreted as "unchanged".
+	if admin, ok := out["admin"].(map[string]any); ok {
+		admin["password"] = ""
+	}
+	if ts, ok := out["turnstile"].(map[string]any); ok {
+		ts["api_key"] = ""
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
@@ -259,17 +281,9 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	s.cfg.Lock()
-	err = json.Unmarshal(body, s.cfg)
-	if err == nil {
-		err = s.cfg.Reindex()
-	}
-	s.cfg.Unlock()
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	if err := s.cfg.Validate(); err != nil {
+	// ReplaceJSON validates first and rolls back on rejection, so a bad
+	// payload can never leave half-applied state in the running config.
+	if err := s.cfg.ReplaceJSON(body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}

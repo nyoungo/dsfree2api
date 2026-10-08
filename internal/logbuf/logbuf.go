@@ -32,19 +32,19 @@ func New(limit int) *Buffer {
 	return &Buffer{subs: map[int]chan Entry{}, limit: limit}
 }
 
+// Add appends an entry and fans it out. The sends stay under the lock: an
+// unlocked send races Subscribe's unsubscribe closure (which closes the
+// channel under the same lock) and "send on closed channel" is a panic that
+// takes down whatever goroutine was logging. The sends never block, so the
+// lock is only held for a bounded number of non-blocking sends.
 func (b *Buffer) Add(e Entry) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.entries = append(b.entries, e)
 	if len(b.entries) > b.limit {
 		b.entries = b.entries[len(b.entries)-b.limit:]
 	}
-	chans := make([]chan Entry, 0, len(b.subs))
 	for _, ch := range b.subs {
-		chans = append(chans, ch)
-	}
-	b.mu.Unlock()
-
-	for _, ch := range chans {
 		select {
 		case ch <- e:
 		default:

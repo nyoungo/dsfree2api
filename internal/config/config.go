@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -537,13 +539,16 @@ func (c *Config) applyEnv() error {
 		}
 		c.Server.Port = n
 	}
-	if v := str("API_KEYS"); v != nil {
+	// 只有"变量存在且非空"才覆盖配置文件：compose 的 `API_KEYS: ${API_KEYS:-}`
+	// 会让变量恒存在，空值必须视为"不覆盖"，否则会把 config.toml 的 key 清空
+	// 并静默关闭鉴权。
+	if v := str("API_KEYS"); v != nil && strings.TrimSpace(*v) != "" {
 		c.Security.APIKeys = splitList(*v)
 	}
-	if v := str("PROXY_URL"); v != nil {
+	if v := str("PROXY_URL"); v != nil && strings.TrimSpace(*v) != "" {
 		c.Proxy.URL = strings.TrimSpace(*v)
 	}
-	if v := str("PROXY_FALLBACK_URLS"); v != nil {
+	if v := str("PROXY_FALLBACK_URLS"); v != nil && strings.TrimSpace(*v) != "" {
 		c.Proxy.FallbackURLs = splitList(*v)
 	}
 	if v := str("PROXY_SLOW_START_SECONDS"); v != nil {
@@ -633,7 +638,15 @@ func splitList(v string) []string {
 	return out
 }
 
+// Validate takes the write lock because it also normalizes fields
+// (upstream.continue_rounds), so it must not run concurrently with a mutation.
 func (c *Config) Validate() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.validateLocked()
+}
+
+func (c *Config) validateLocked() error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
 		return fmt.Errorf("server.port out of range: %d", c.Server.Port)
 	}
@@ -723,14 +736,24 @@ func (c *Config) Save() error {
 	return c.SaveTo(c.path)
 }
 
+// SaveTo encodes the config with a read lock held: toml.Encode iterates the
+// Sites/Models/... maps, which admin actions mutate under the write lock, and
+// an unlocked iteration racing a map write is a fatal (unrecoverable) error.
 func (c *Config) SaveTo(path string) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.saveToLocked(path)
+}
+
+func (c *Config) saveToLocked(path string) error {
 	if path == "" {
 		return errors.New("config path is empty")
 	}
 	if _, err := os.Stat(path); err == nil {
 		backup := path + ".bak"
 		if raw, err := os.ReadFile(path); err == nil {
-			_ = os.WriteFile(backup, raw, 0o644)
+			// .bak 里同样是 api_keys / admin password，收紧到 0600
+			_ = os.WriteFile(backup, raw, 0o600)
 		}
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
@@ -743,7 +766,92 @@ func (c *Config) SaveTo(path string) error {
 		return fmt.Errorf("encode config: %w", err)
 	}
 	header := "# dsfree2api configuration\n# Managed by the web console; a .bak copy is kept next to this file.\n\n"
-	return os.WriteFile(path, []byte(header+sb.String()), 0o644)
+	data := []byte(header + sb.String())
+
+	// 原子替换：先写同目录临时文件再 rename。裸 WriteFile 会先把目标截断，
+	// 写一半时进程崩溃就留下损坏的 config.toml（下次启动直接 config error），
+	// 并发读者也会读到空/半截内容。
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("write config temp: %w", err)
+	}
+	if err := renameReplace(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
+}
+
+// renameReplace 把 src 重命名覆盖到 dst。Windows 上目标文件被并发读者以
+// 不带 FILE_SHARE_DELETE 的方式打开时 MoveFileEx 会报 sharing violation，
+// 而读者都是瞬间的 ReadFile，退避重试即可等到空档；其他平台首次即成功。
+func renameReplace(src, dst string) error {
+	var err error
+	for i := 0; i < 100; i++ {
+		if err = os.Rename(src, dst); err == nil {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return err
+}
+
+// ReplaceJSON applies a console payload in one shot: decode into the live
+// config only after the payload itself is known to be well-formed, and roll
+// back to the pre-request snapshot when reindexing or validation rejects it,
+// so a failed PUT never leaves half-applied state behind in memory.
+func (c *Config) ReplaceJSON(raw []byte) error {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	snapshot, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	// json 解码对 map 是"合并"语义，待替换的键必须先清空才能真正替换
+	if _, ok := probe["sites"]; ok {
+		c.Sites = nil
+	}
+	if _, ok := probe["models"]; ok {
+		c.Models = nil
+	}
+	if _, ok := probe["proxypool"]; ok {
+		c.ProxyPool.Entries = nil
+		c.ProxyPool.Subscriptions = nil
+	}
+	curPassword, curTSKey := c.Admin.Password, c.Turnstile.APIKey
+	if err := json.Unmarshal(raw, c); err != nil {
+		c.restoreLocked(snapshot)
+		return err
+	}
+	// 控制台 GET 会把这两个密钥抹成空串再原样回传：空值 = 保持不变
+	if c.Admin.Password == "" {
+		c.Admin.Password = curPassword
+	}
+	if strings.TrimSpace(c.Turnstile.APIKey) == "" {
+		c.Turnstile.APIKey = curTSKey
+	}
+	if err := c.Reindex(); err != nil {
+		c.restoreLocked(snapshot)
+		return err
+	}
+	if err := c.validateLocked(); err != nil {
+		c.restoreLocked(snapshot)
+		return err
+	}
+	return nil
+}
+
+// restoreLocked puts back a JSON snapshot taken under the same lock.
+func (c *Config) restoreLocked(snapshot []byte) {
+	c.Sites, c.Models = nil, nil
+	c.ProxyPool.Entries, c.ProxyPool.Subscriptions = nil, nil
+	_ = json.Unmarshal(snapshot, c)
 }
 
 // DataDir resolves (and creates) the runtime data directory.

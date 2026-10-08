@@ -63,7 +63,13 @@ func TryParseToolCalls(text string) (string, []ToolCall, bool) {
 				Name      string          `json:"name"`
 				Arguments json.RawMessage `json:"arguments"`
 			}
-			_ = json.Unmarshal(tc.Function, &fn)
+			// function 字段缺失或解析不出名字的条目是坏数据：标记 bad 让整
+			// 个候选被丢弃，而不是把一个 name 为空的 tool call 交给客户端
+			// （错误被吞掉后要到执行阶段才暴露）。
+			if err := json.Unmarshal(tc.Function, &fn); err != nil || fn.Name == "" {
+				bad = true
+				break
+			}
 			args := "{}"
 			if len(fn.Arguments) > 0 {
 				var s string

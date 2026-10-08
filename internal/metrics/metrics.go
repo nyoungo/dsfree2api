@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -168,6 +169,13 @@ func (r *Recorder) IncInFlight(delta int64) {
 		r.inflight = 0
 	}
 	r.mu.Unlock()
+}
+
+// InFlight 当前正在处理的请求数（并发数仪表盘用）。
+func (r *Recorder) InFlight() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inflight
 }
 
 // Record stores one completed request.
@@ -391,7 +399,10 @@ func (r *Recorder) Reset() {
 	r.latency = nil
 }
 
-func (r *Recorder) Save() {
+// Save 持久化计数。失败会写日志并把错误返回给调用方 —— 之前
+// mkdir/写临时文件/rename 的错误全被静默吞掉，磁盘满或权限出问题时
+// 指标会悄悄丢光、日志里毫无痕迹。
+func (r *Recorder) Save() error {
 	r.mu.Lock()
 	p := persisted{
 		Total: r.total, Errors: r.errs, Empty: r.empty, Denied: r.denied,
@@ -402,20 +413,33 @@ func (r *Recorder) Save() {
 	r.mu.Unlock()
 
 	if path == "" {
-		return
+		return nil
 	}
+	if err := persistMetrics(path, p); err != nil {
+		slog.Default().Error("metrics save failed", "path", path, "err", err)
+		return err
+	}
+	return nil
+}
+
+// persistMetrics 写 .tmp 后原子替换；任何一步失败都原样返回错误。
+func persistMetrics(path string, p persisted) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
+		return err
 	}
 	raw, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return
+		return err
 	}
-	_ = os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func (r *Recorder) load() {

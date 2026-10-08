@@ -66,9 +66,12 @@ type cookieState struct {
 type core struct {
 	proxy  string
 	client *http.Client
-	mu     sync.Mutex
-	cache  map[string]*cookieState
-	locks  map[string]*sync.Mutex
+	// clientErr 记录 StdClient 构建失败的原因：代理 URL 非法时 client 为 nil，
+	// 调用方必须显式报错而不是 nil panic。
+	clientErr error
+	mu        sync.Mutex
+	cache     map[string]*cookieState
+	locks     map[string]*sync.Mutex
 }
 
 func (c *core) lockFor(site string) *sync.Mutex {
@@ -140,16 +143,27 @@ func (s *Solver) coreFor(proxy string) *core {
 	defer s.mu.Unlock()
 	c, ok := s.cores[key]
 	if !ok {
-		client, _ := httpx.StdClient(proxy, time.Duration(s.cfg.SolveTimeoutValue()+30)*time.Second)
+		client, clientErr := httpx.StdClient(proxy, time.Duration(s.cfg.SolveTimeoutValue()+30)*time.Second)
 		c = &core{
-			proxy:  key,
-			client: client,
-			cache:  map[string]*cookieState{},
-			locks:  map[string]*sync.Mutex{},
+			proxy:     key,
+			client:    client,
+			clientErr: clientErr,
+			cache:     map[string]*cookieState{},
+			locks:     map[string]*sync.Mutex{},
 		}
 		s.cores[key] = c
 	}
 	return c
+}
+
+// solveAttempts 把 retries 归一为至少 1 次尝试。retries 表示"额外重试次数"，
+// 0 不能意味着一次都不做：那会让 solveToken 返回 ("", nil)、verifyToken 直接
+// 返回 nil，refreshLocked 便把未经求解/校验的 cookie 当成功缓存。
+func solveAttempts(retries int) int {
+	if retries < 1 {
+		return 1
+	}
+	return retries
 }
 
 func (s *Solver) Invalidate(siteCode string) {
@@ -423,8 +437,17 @@ func (s *Solver) solveTokenAPI(ctx context.Context, baseURL, sitekey string, c *
 	client := c.client
 	if isLocalHost(cfg.APIURL) {
 		client = &http.Client{Timeout: time.Duration(cfg.SolveTimeoutValue()+30) * time.Second}
+	} else if client == nil {
+		// 代理 URL 非法导致 StdClient 构建失败：显式失败，不能带着 nil
+		// client 进循环（client.Do 会 nil panic）。
+		msg := "turnstile solve client unavailable"
+		if c.clientErr != nil {
+			msg = fmt.Sprintf("proxy %q is invalid: %v", c.proxy, c.clientErr)
+		}
+		return "", &Error{Msg: msg, Retryable: false}
 	}
-	for attempt := 0; attempt < cfg.Retries; attempt++ {
+	attempts := solveAttempts(cfg.Retries)
+	for attempt := 0; attempt < attempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.APIURL, bytes.NewReader(payload))
 		if err != nil {
 			return "", err
@@ -541,7 +564,7 @@ func (s *Solver) verifyToken(ctx context.Context, sess httpx.Session, site *conf
 		"Content-Type":     "application/x-www-form-urlencoded",
 	}
 	var last error
-	for attempt := 0; attempt < cfg.Retries; attempt++ {
+	for attempt := 0; attempt < solveAttempts(cfg.Retries); attempt++ {
 		resp, err := sess.Do(ctx, httpx.Request{
 			Method:  "POST",
 			URL:     site.AJAXURL,
