@@ -1,16 +1,21 @@
 package admin
 
 import (
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/nyoungo/dsfree2api/internal/config"
 	"github.com/nyoungo/dsfree2api/internal/logbuf"
@@ -21,8 +26,15 @@ import (
 	"github.com/nyoungo/dsfree2api/internal/upstream"
 )
 
+// Admin login throttling: five failed attempts within the window lock the
+// client out for the same window.
+const (
+	adminMaxFails   = 5
+	adminLockWindow = 5 * time.Minute
+)
+
 // Version is reported by the console and /api/overview.
-var Version = "0.6.3"
+var Version = "0.6.4"
 
 //go:embed web/*
 var webFS embed.FS
@@ -38,9 +50,20 @@ type Server struct {
 	log   *slog.Logger
 	start time.Time
 
-	mu       sync.Mutex
-	tokens   map[string]time.Time
-	password string
+	mu                sync.Mutex
+	tokens            map[string]time.Time
+	passwordHash      []byte
+	passwordPreHashed bool
+
+	loginMu    sync.Mutex
+	loginFails map[string]*loginFail
+}
+
+// loginFail tracks one client's failed login attempts for throttling.
+type loginFail struct {
+	count int
+	first time.Time
+	until time.Time
 }
 
 func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *logbuf.Buffer, ts *turnstile.Solver, log *slog.Logger, pool *proxypool.Manager, qw *quota.Watcher) *Server {
@@ -53,15 +76,100 @@ func New(cfg *config.Config, up *upstream.Client, met *metrics.Recorder, logs *l
 		pw = randomToken(12)
 		generated = true
 	}
+	hash, preHashed := derivePasswordHash(pw)
 	s := &Server{
 		cfg: cfg, up: up, met: met, logs: logs, ts: ts, pool: pool, quota: qw, log: log,
-		start: time.Now(), tokens: map[string]time.Time{}, password: pw,
+		start: time.Now(), tokens: map[string]time.Time{},
+		passwordHash: hash, passwordPreHashed: preHashed,
+		loginFails: map[string]*loginFail{},
 	}
 	if generated {
 		s.log.Warn("admin password was not configured — generated a one-time password",
 			"password", pw, "hint", "set admin.password in config.toml or ADMIN_PASSWORD to make it stable")
 	}
 	return s
+}
+
+// derivePasswordHash turns the configured admin password into a bcrypt hash.
+// An already-bcrypt value is used verbatim; a plaintext value is pre-hashed
+// with SHA-256 first, which both removes bcrypt's 72-byte input limit and
+// keeps login comparisons constant-time.
+func derivePasswordHash(pw string) ([]byte, bool) {
+	if isBcryptHash(pw) {
+		return []byte(pw), true
+	}
+	sum := sha256.Sum256([]byte(pw))
+	hash, err := bcrypt.GenerateFromPassword(sum[:], bcrypt.DefaultCost)
+	if err != nil {
+		return nil, false
+	}
+	return hash, false
+}
+
+func isBcryptHash(s string) bool {
+	if len(s) != 60 {
+		return false
+	}
+	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
+}
+
+func (s *Server) passwordMatches(input string) bool {
+	if len(s.passwordHash) == 0 {
+		return false
+	}
+	candidate := []byte(input)
+	if !s.passwordPreHashed {
+		sum := sha256.Sum256([]byte(input))
+		candidate = sum[:]
+	}
+	return bcrypt.CompareHashAndPassword(s.passwordHash, candidate) == nil
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// loginLockRemaining returns the time left in a lockout, or 0 when free.
+func (s *Server) loginLockRemaining(key string) time.Duration {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	f := s.loginFails[key]
+	if f == nil {
+		return 0
+	}
+	now := time.Now()
+	if now.Before(f.until) {
+		return f.until.Sub(now)
+	}
+	if f.until.IsZero() && now.Sub(f.first) > adminLockWindow {
+		delete(s.loginFails, key)
+	}
+	return 0
+}
+
+func (s *Server) recordLoginFailure(key string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	now := time.Now()
+	f := s.loginFails[key]
+	if f == nil || now.Sub(f.first) > adminLockWindow {
+		f = &loginFail{first: now}
+		s.loginFails[key] = f
+	}
+	f.count++
+	if f.count >= adminMaxFails {
+		f.until = now.Add(adminLockWindow)
+	}
+}
+
+func (s *Server) clearLoginFailures(key string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	delete(s.loginFails, key)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -124,15 +232,25 @@ func (s *Server) validToken(tok string) bool {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	client := clientIP(r)
+	if wait := s.loginLockRemaining(client); wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error": "too many failed login attempts; try again later",
+		})
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	if body.Password != s.password {
+	if !s.passwordMatches(body.Password) {
+		s.recordLoginFailure(client)
 		time.Sleep(300 * time.Millisecond)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid password"})
 		return
 	}
+	s.clearLoginFailures(client)
 	tok := randomToken(24)
 	s.mu.Lock()
 	for k, exp := range s.tokens {
