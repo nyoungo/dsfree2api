@@ -1,6 +1,6 @@
 ﻿# dsfree2api — build / test helpers
 GO      ?= go
-VERSION ?= 0.6.4
+VERSION ?= 0.6.5
 LDFLAGS := -s -w -X github.com/nyoungo/dsfree2api/internal/admin.Version=$(VERSION)
 BIN     := bin/dsfree2api
 IMAGE   ?= dsfree2api:latest

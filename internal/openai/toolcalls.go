@@ -45,7 +45,8 @@ func optionsForTools(tools []ToolDef) ParseOptions {
 // output. It mirrors the Python/Rust implementations: plain JSON, ```json
 // fences, generic ``` fences, XML/<tool_call>/<invoke> wrappers and the usual
 // model repairs (unquoted keys, invalid backslashes, field aliases,
-// swapped/ spilled arguments) are all accepted.
+// swapped/ spilled arguments) are all accepted, plus DeepSeek's DSML dialect
+// (see dsml.go) including truncated blocks with missing closing tags.
 //
 // Returns the remaining prose plus the parsed tool calls (ok=false when the
 // text is ordinary chat).
@@ -61,10 +62,33 @@ func TryParseToolCallsForTools(text string, tools []ToolDef) (string, []ToolCall
 
 // TryParseToolCallsWith is TryParseToolCalls with explicit options.
 func TryParseToolCallsWith(text string, opts ParseOptions) (string, []ToolCall, bool) {
+	norm, isDSML := normalizeDSML(text)
+	// DSML 方言优先按 tagged 路径解析：参数内容里形如 [{"name":…}] 的片段是
+	// 正被写入的文件数据，若先跑 JSON 候选路径会被抢成假调用；解析失败时
+	// 仍回落到下面的常规两段路径。
+	if isDSML {
+		if remaining, calls, ok := parseTaggedToolCalls(ensureTaggedStart(norm, opts), opts); ok && matchesOfferedTools(calls, opts) {
+			return remaining, calls, true
+		}
+	}
 	if remaining, calls, ok := parseJSONToolCalls(text, opts); ok {
 		return remaining, calls, true
 	}
 	return parseTaggedToolCalls(text, opts)
+}
+
+// matchesOfferedTools 报告解析结果与工具清单是否相容：DSML 只是兜底方言，
+// 调用名不在已提供的工具里时多半是散文引用了标记格式，按普通文本返回。
+func matchesOfferedTools(calls []ToolCall, opts ParseOptions) bool {
+	if len(opts.ToolNames) == 0 {
+		return true
+	}
+	for _, c := range calls {
+		if !containsString(opts.ToolNames, c.Function.Name) {
+			return false
+		}
+	}
+	return len(calls) > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +483,14 @@ func parseTaggedToolCalls(text string, opts ParseOptions) (string, []ToolCall, b
 // or object first, then the XML dialects.
 func extractTaggedCalls(inner string, opts ParseOptions) []ToolCall {
 	fallbackName := extractXMLName(inner)
+	// 以 <invoke 开头的块是 XML 方言：先按标签解析，否则参数内容里恰好
+	// 形如 [{"name": …}] 的片段（例如正被写入的 JSON 文件）会被 JSON
+	// 路径抢走，产出一个假调用、丢掉真实调用。
+	if strings.HasPrefix(strings.ToLower(strings.TrimLeft(inner, " \t\r\n")), "<invoke") {
+		if calls := parseXMLInvokeCalls(inner, opts); len(calls) > 0 {
+			return calls
+		}
+	}
 	if calls := parseJSONInText(inner, opts, fallbackName); len(calls) > 0 {
 		return calls
 	}
@@ -511,16 +543,22 @@ func parseXMLInvokeCalls(inner string, opts ParseOptions) []ToolCall {
 		head := inner[abs : abs+gt+1]
 		bodyStart := abs + gt + 1
 		ci := strings.Index(lower[bodyStart:], "</invoke>")
-		if ci < 0 {
-			return calls
+		// 截断兜底：闭标签缺失时把剩余文本整体当作 body，最后一个
+		// parameter 的值由 parseXMLParams 取到末尾。
+		bodyEnd := len(inner)
+		if ci >= 0 {
+			bodyEnd = bodyStart + ci
 		}
-		body := inner[abs : bodyStart+ci]
+		body := inner[abs:bodyEnd]
 		name := xmlAttr(head, "name")
 		if name == "" {
 			name = xmlTagValue(body, "name")
 		}
 		if name != "" {
 			calls = append(calls, makeXMLCall(name, parseXMLParams(body)))
+		}
+		if ci < 0 {
+			return calls
 		}
 		pos = bodyStart + ci + len("</invoke>")
 	}
@@ -592,6 +630,12 @@ func parseXMLParams(body string) map[string]any {
 				break
 			}
 			abs := pos + i
+			// `<param` 是 `<parameter` 的前缀：命中更长标签时跳过，交给
+			// 另一轮处理，否则会把 parameter 的值当成本轮截断尾部覆盖。
+			if abs+len(open) < len(lower) && isTagNameChar(lower[abs+len(open)]) {
+				pos = abs + len(open)
+				continue
+			}
 			gt := strings.IndexByte(body[abs:], '>')
 			if gt < 0 {
 				break
@@ -604,13 +648,21 @@ func parseXMLParams(body string) map[string]any {
 			}
 			name := xmlAttr(head, "name")
 			ci := strings.Index(lower[bodyStart:], closeTag)
-			if ci < 0 {
-				break
+			// 截断兜底：闭标签缺失时，值取到下一个同名开标签或 body 末尾。
+			end := len(body)
+			if ci >= 0 {
+				end = bodyStart + ci
+			} else if j := strings.Index(lower[bodyStart:], open); j >= 0 {
+				end = bodyStart + j
 			}
 			if name != "" {
-				params[name] = coerceXMLValue(body[bodyStart : bodyStart+ci])
+				params[name] = coerceXMLValue(body[bodyStart:end])
 			}
-			pos = bodyStart + ci + len(closeTag)
+			if ci < 0 {
+				pos = end
+				continue
+			}
+			pos = end + len(closeTag)
 		}
 	}
 	if len(params) == 0 {
@@ -624,6 +676,10 @@ func parseXMLParams(body string) map[string]any {
 		}
 	}
 	return params
+}
+
+func isTagNameChar(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 func coerceXMLValue(s string) any {

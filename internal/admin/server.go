@@ -34,7 +34,7 @@ const (
 )
 
 // Version is reported by the console and /api/overview.
-var Version = "0.6.4"
+var Version = "0.6.5"
 
 //go:embed web/*
 var webFS embed.FS

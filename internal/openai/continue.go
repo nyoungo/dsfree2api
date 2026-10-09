@@ -28,6 +28,9 @@ func ContinuationContext(partial string, head, tail int) string {
 // caps each generation (~1k tokens), so large tool-call JSON arrives in
 // pieces; the model must continue byte-for-byte instead of restarting.
 func ContinueInstruction(partial string, round, maxRounds int) string {
+	if preferDSMLContinue(partial) {
+		return dsmlContinueInstruction(partial, round, maxRounds)
+	}
 	tail := partial
 	if n := len(tail); n > 80 {
 		tail = tail[n-80:]
@@ -51,9 +54,36 @@ func ContinueInstruction(partial string, round, maxRounds int) string {
 		deadline, utf8.RuneCountInString(partial), tail)
 }
 
+// dsmlContinueInstruction 是 DSML 方言的续写指令：要求模型按原标记格式
+// 逐字符续写并补齐缺失的闭合标签。XML 内容里的换行是合法字符，因此不套用
+// JSON 分支的“换行必须写成 \n 转义”规则。
+func dsmlContinueInstruction(partial string, round, maxRounds int) string {
+	tail := partial
+	if n := len(tail); n > 80 {
+		tail = tail[n-80:]
+	}
+	deadline := fmt.Sprintf("这是第 %d/%d 次续写。", round, maxRounds)
+	if round >= maxRounds {
+		deadline += "这是最后一次续写机会：本轮必须先收束剩余内容（补齐未完成的标记），随后立即闭合全部标签并结束回复，禁止再展开任何新段落。"
+	} else {
+		deadline += "每轮只能输出约 2300 字符；若主体已完成或接近完成，请立即补齐缺失的闭合标签收尾，不要无限扩展。"
+	}
+	return fmt.Sprintf(
+		"上一条 assistant 回复因通道输出上限被截断（上面保留了它的开头与最新末尾，中间已省略），%s目前已输出约 %d 个字符，最后 80 个字符是：\n%s\n\n"+
+			"请只输出【续写片段】：从上面末尾片段的最后一个字符之后开始逐字符接着写，直到整个工具调用标记完整闭合。"+
+			"严格禁止：重复任何已输出内容、以 < 或 { 开头、重新生成整段工具调用结构、任何解释或前后缀。"+
+			"参数内容写完后必须立即按原格式依次补齐缺失的闭合标签（parameter、invoke 及外层 calls），然后立刻结束回复；"+
+			"参数内容中的换行、制表符按原样输出即可，无需转义。"+
+			"禁止输出任何解释、Markdown 标记或后记文字。"+
+			"注意合理收尾：内容已经很长，若主体已经完成就立即闭合标签结束，不要无限扩展新段落。"+
+			"你的回复的第一个字符必须正好是被截断处的下一个字符。",
+		deadline, utf8.RuneCountInString(partial), tail)
+}
+
 // ToolCallTruncated reports whether text looks like a forced tool-call JSON
 // reply (see toolsPrompt) that the channel cut off before it could close.
 // Fenced ```json blocks are unwrapped first, mirroring TryParseToolCalls.
+// Text without a JSON payload falls back to the DSML dialect check.
 func ToolCallTruncated(text string) bool {
 	cand := strings.TrimSpace(text)
 	if !strings.HasPrefix(cand, "{") {
@@ -68,7 +98,8 @@ func ToolCallTruncated(text string) bool {
 		// evaluate the payload itself, mirroring TryParseToolCalls.
 		i := strings.Index(cand, `{"tool_calls"`)
 		if i <= 0 {
-			return false
+			// 没有 JSON 载荷：再看是不是被截断的 DSML 方言标记。
+			return dsmlTruncated(text)
 		}
 		cand = cand[i:]
 	}
@@ -274,7 +305,12 @@ func RunContinued(
 			break
 		}
 		raw := seg.String()
-		piece := TrimOverlap(partial, EscapeControlsAfter(partial, raw))
+		// DSML/XML 内容里的换行是合法字符，不能套用 JSON 字符串的转义规则。
+		healed := raw
+		if !preferDSMLContinue(partial) {
+			healed = EscapeControlsAfter(partial, raw)
+		}
+		piece := TrimOverlap(partial, healed)
 		if piece == "" {
 			warn("tool-call continuation produced no new text", "round", round+1, "seg_chars", len(raw))
 			break
