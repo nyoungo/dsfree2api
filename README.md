@@ -5,16 +5,6 @@
 [![Docker](https://img.shields.io/badge/docker-supported-2496ED?logo=docker&logoColor=white)](./docker-compose.yml)
 
 
-
-# 悲报
-## 把人家官网蹬没钱了，看看还能充值不，哈哈哈哈
-## 不过也确认了 官网对接的是deepseek的api 不是自己部署的
-
-
-
-
-
-
 逆向 **deepseek.de / deepseek.es / deepseek.fr** 三个站点的 V4-Flash / V4-Pro 模型，提供 **OpenAI API 完全兼容** 的中转服务。
 
 Go 实现，编译为**单个静态二进制**，无运行时依赖；内置 **Web 管理控制台**（模型 / Key / 代理 / Turnstile / 日志 / 调试）。
