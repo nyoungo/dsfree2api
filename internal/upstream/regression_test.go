@@ -1,10 +1,8 @@
 package upstream
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -228,28 +226,5 @@ func TestShortJSONKeepsUTF8Valid(t *testing.T) {
 	})
 	if !utf8.ValidString(got) {
 		t.Fatalf("shortJSON 切出了非法 UTF-8: %q", got)
-	}
-}
-
-// 回归：quota 冷却在窗口内被重复触发时只记一次 INFO（注释说的
-// "the INFO line marks the transition, not every probe that confirms it"），
-// 但冷却截止时间每次都要顺延。
-func TestQuotaCoolLogsOncePerTransition(t *testing.T) {
-	cfg := testConfig(t)
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	c := New(cfg, nil, log, nil)
-
-	c.setQuotaCool("site-a")
-	first := c.quotaCool["site-a"]
-	time.Sleep(5 * time.Millisecond)
-	c.setQuotaCool("site-a")
-	second := c.quotaCool["site-a"]
-
-	if !second.After(first) {
-		t.Fatalf("重复触发没有顺延冷却时间: %v -> %v", first, second)
-	}
-	if n := strings.Count(buf.String(), "site quota cooldown"); n != 1 {
-		t.Fatalf("冷却 INFO 条数 = %d, want 1\nlog: %s", n, buf.String())
 	}
 }

@@ -69,9 +69,6 @@ type Client struct {
 	cfgLocks map[string]*sync.Mutex
 	gates    map[string]*siteGate
 
-	// quotaCool marks sites that recently answered with quota errors; they
-	// are tried after the healthy mirrors until the cooldown expires.
-	quotaCool map[string]time.Time
 	// lastWarn* dedupes repeated identical upstream errors so a quota
 	// storm cannot drown the log.
 	lastWarnMsg string
@@ -92,14 +89,13 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger, pool RouteS
 		log = slog.Default()
 	}
 	return &Client{
-		cfg:       cfg,
-		ts:        ts,
-		log:       log,
-		pool:      pool,
-		chatCfg:   map[string]chatConfig{},
-		cfgLocks:  map[string]*sync.Mutex{},
-		gates:     map[string]*siteGate{},
-		quotaCool: map[string]time.Time{},
+		cfg:      cfg,
+		ts:       ts,
+		log:      log,
+		pool:     pool,
+		chatCfg:  map[string]chatConfig{},
+		cfgLocks: map[string]*sync.Mutex{},
+		gates:    map[string]*siteGate{},
 	}
 }
 
@@ -141,65 +137,6 @@ func (c *Client) Routes() []Route {
 	return out
 }
 
-// quotaCoolTTL is how long a site that answered with quota errors keeps
-// being tried after its healthy mirrors.
-const quotaCoolTTL = 10 * time.Minute
-
-// quotaCooled reports whether a site is inside its quota cooldown window.
-func (c *Client) quotaCooled(code string) bool {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	until, ok := c.quotaCool[code]
-	return ok && time.Now().Before(until)
-}
-
-// setQuotaCool cools a site down after it reported quota exhaustion.
-// Repeat detections inside the window only extend it; the INFO line marks
-// the transition, not every probe that confirms it.
-func (c *Client) setQuotaCool(code string) {
-	c.stateMu.Lock()
-	_, wasCooled := c.quotaCool[code]
-	// 每次都把截止时间顺延，重复探测只延长窗口；只有从"未冷却"进入
-	// "冷却"这一次状态翻转才记 INFO，之后的确认探测不再刷日志。
-	c.quotaCool[code] = time.Now().Add(quotaCoolTTL)
-	c.stateMu.Unlock()
-	if !wasCooled {
-		c.log.Info("site quota cooldown", "site", code, "for", quotaCoolTTL)
-	}
-}
-
-// sortQuotaCoolLast moves quota-cooled sites behind the healthy candidates,
-// preserving relative order inside both groups.
-func (c *Client) sortQuotaCoolLast(ids []string) []string {
-	var cooled, rest []string
-	for _, id := range ids {
-		m, ok := c.modelCopy(id)
-		if ok && c.quotaCooled(m.Site) {
-			cooled = append(cooled, id)
-			continue
-		}
-		rest = append(rest, id)
-	}
-	if len(cooled) == 0 {
-		return ids
-	}
-	return append(rest, cooled...)
-}
-
-// clearQuotaCool lifts a site's cooldown once it serves again after a quota
-// error — the fresh visitor identity restored its daily tier.
-func (c *Client) clearQuotaCool(code string) {
-	c.stateMu.Lock()
-	_, ok := c.quotaCool[code]
-	if ok {
-		delete(c.quotaCool, code)
-	}
-	c.stateMu.Unlock()
-	if ok {
-		c.log.Info("site quota restored", "site", code)
-	}
-}
-
 // probeBalanceAsync logs the site's current free tier after a quota
 // recovery. Best effort — failures only show up at DEBUG.
 func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route Route) {
@@ -223,14 +160,10 @@ func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route R
 	}()
 }
 
-// logUpstreamErr records one failed upstream attempt. Quota errors cool the
-// site down and repeats of an identical error inside a short window drop to
-// DEBUG, so a balance-starved site neither taxes every continuation round
-// nor floods the log.
-func (c *Client) logUpstreamErr(site, modelID string, attempt int, route Route, err error) {
-	if isQuota(err) {
-		c.setQuotaCool(site)
-	}
+// logUpstreamErr records one failed upstream attempt. Repeats of an identical
+// error inside a short window drop to DEBUG, so a quota storm cannot drown
+// the log.
+func (c *Client) logUpstreamErr(modelID string, attempt int, route Route, err error) {
 	msg := err.Error()
 	c.stateMu.Lock()
 	dup := msg == c.lastWarnMsg && time.Since(c.lastWarnAt) < 30*time.Second
@@ -320,10 +253,6 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
 			candidates = append(candidates, alt)
 		}
 	}
-	// A site that recently reported quota errors keeps being tried, but
-	// behind the healthy mirrors — continuation rounds stop paying its
-	// refresh tax while its balance is empty.
-	candidates = c.sortQuotaCoolLast(candidates)
 
 	var last error
 	triedPrimary := false
@@ -340,7 +269,7 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
 			m = mc
 		}
 		// Only a real switch after a failed candidate is a failover; the
-		// first pick of a request (even a sorted-past primary) is not.
+		// first pick of a request is not.
 		if prev != "" && prev != id {
 			c.log.Warn("cross-site failover", "from", prev, "to", id)
 		}
@@ -354,9 +283,8 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
 		}
 		// Quota means this site has no balance and a cache-rejection means
 		// its session is off: the next candidate is the point. Other errors
-		// keep going only while the primary has not had its chance yet (a
-		// quota-cooled primary sits at the end of the list); once it failed
-		// too, report that error as before.
+		// keep going only while the primary has not had its chance yet;
+		// once it failed too, report that error as before.
 		if !isQuota(err) && !isCacheEmptyProblem(err) && triedPrimary {
 			return AsUpstream(err)
 		}
@@ -436,7 +364,6 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 			err := c.chatOnceSlowStart(ctx, site, modelID, model, prompt, route, allowSlow, info, yield)
 			if err == nil {
 				if sawQuota {
-					c.clearQuotaCool(site.Code)
 					c.probeBalanceAsync(site, model, route)
 				}
 				c.poolReport(route.Proxy, true)
@@ -479,7 +406,7 @@ func (c *Client) chatWithRetries(ctx context.Context, modelID string, model conf
 				c.poolReport(route.Proxy, false)
 			}
 			failed = append(failed, route)
-			c.logUpstreamErr(site.Code, modelID, attempt, route, err)
+			c.logUpstreamErr(modelID, attempt, route, err)
 			if isQuota(err) {
 				sawQuota = true
 				// The free daily tier is keyed to the visitor cookie, so a

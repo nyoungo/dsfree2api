@@ -219,13 +219,8 @@ func (w *Watcher) record(site string, ref botRef, route string, payload *balance
 		}
 	}
 
-	var lowNow, recovered, resetSeen bool
-	var prevUsed int64
+	var lowNow, recovered bool
 	w.mu.Lock()
-	if prev := w.entries[key]; prev != nil && prev.Error == "" && err == nil && b.Used < prev.Used {
-		resetSeen = true
-		prevUsed = prev.Used
-	}
 	w.entries[key] = b
 	prevErr := w.lastErr[key]
 	w.lastErr[key] = b.Error
@@ -255,12 +250,6 @@ func (w *Watcher) record(site string, ref botRef, route string, payload *balance
 	w.log.Debug("quota check",
 		"site", site, "bot_id", ref.id, "model", ref.model, "route", b.Route,
 		"remaining", b.Remaining, "limit", b.Limit, "used", b.Used)
-	if resetSeen {
-		w.log.Info("quota reset observed",
-			"site", site, "bot_id", ref.id, "model", ref.model, "route", b.Route,
-			"used_before", prevUsed, "used_after", b.Used,
-			"checked_at", time.Unix(b.CheckedAt, 0).Format(time.RFC3339))
-	}
 	switch {
 	case lowNow:
 		w.log.Warn("quota low",

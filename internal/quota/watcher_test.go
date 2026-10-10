@@ -1,9 +1,7 @@
 package quota
 
 import (
-	"bytes"
 	"context"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,24 +14,6 @@ import (
 )
 
 const examplePath = "../../config.example.toml"
-
-func TestQuotaResetIsRecorded(t *testing.T) {
-	cfg, err := config.Load(examplePath)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	var buf bytes.Buffer
-	w := New(cfg, slog.New(slog.NewTextHandler(&buf, nil)), nil, nil)
-	ref := botRef{id: 7, model: "m"}
-	w.record("de", ref, "", &balancePayload{Free: &freeQuota{Limit: 30000, Used: 500, Remaining: 29500, ResetPeriod: "daily"}}, nil, 0.2)
-	w.record("de", ref, "", &balancePayload{Free: &freeQuota{Limit: 30000, Used: 0, Remaining: 30000, ResetPeriod: "daily"}}, nil, 0.2)
-	if !strings.Contains(buf.String(), "quota reset observed") {
-		t.Fatalf("expected a reset log line, got:\n%s", buf.String())
-	}
-	if !strings.Contains(buf.String(), "used_before=500") {
-		t.Fatalf("expected used_before=500 in log, got:\n%s", buf.String())
-	}
-}
 
 func TestSweepReadsBalancesWithPooledCookies(t *testing.T) {
 	var seenGid string

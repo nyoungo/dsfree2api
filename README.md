@@ -142,7 +142,7 @@ dsfree2api -config config.toml -check
 | `[limits]` | `max_concurrent_per_site` 每站点并发、`rate_per_minute` 每 Key 每分钟限流（0 = 不限） |
 | `[proxy]` | `url` 主线路、`fallback_urls` 备用线路、`slow_start_seconds` 首事件超时 |
 | `[proxypool]` | 代理池总开关、健康检查间隔 / 超时 / URL、裸 `ip:port` 默认协议、Xray 路径 / 版本 / 自动下载；`[proxypool.entries.*]` 手动节点（分享链接或端点）、`[proxypool.subscriptions.*]` 订阅自动拉取 |
-| `[quota]` | 配额哨兵：`enabled` / `check_seconds` / `warn_ratio`，定期用池内会话读取站点免费额度，低额告警与重置留档 |
+| `[quota]` | 配额哨兵：`enabled` / `check_seconds` / `warn_ratio`，定期用池内会话读取站点免费额度，低额告警 |
 | `[upstream]` | 超时、配置缓存 TTL、会话自动刷新、`cross_site_failover` 跨站切换、`continue_rounds` 工具调用截断续写轮数（0 = 不续写、直接截断补全） |
 | `[turnstile]` | **默认 `enabled = false` 且不内置任何求解服务**；`provider` 三选一：`api`（填 `api_url` / `api_key`）、`browser`（填 `browser_path` 指向本机 Chrome/Edge）、`manual`（只用控制台导入的 Cookie），另有 Cookie TTL、重试次数、单次求解超时（`timeout_seconds`）、求解服务风格（`api_style`）与 Cookie 池（`warm_enabled` / `warm_ratio` / `warm_check_seconds`，后台预热，请求零等待） |
 | `[sites.*]` | 三个站点的 `base_url` / `ajax_url` / `sitekey` / `language` / `proxies`（站点级出口绑定，按顺序粘性选路）/ `warm_pool_only`（只预热池绑定线路） |
@@ -313,7 +313,7 @@ cmd/dsfree2api        入口：配置加载、日志、双 HTTP server、优雅�
 internal/config       TOML 结构 + 默认值 + env 覆盖 + 校验 + 写回
 internal/httpx        TLS 指纹会话封装（bogdanfinn/tls-client, Chrome_120）
 internal/proxypool    代理池：Xray 核心管理 / 订阅拉取 / 分享链接解析 / 粘性选路与健康探测
-internal/quota        配额哨兵：站点余额轮询 / 低额告警 / 重置留档
+internal/quota        配额哨兵：站点余额轮询 / 低额告警
 internal/openai       OpenAI 协议类型、prompt 拼接、tool_calls 解析
 internal/anthropic    Anthropic Messages 协议类型 + 与 OpenAI 消息的互转
 internal/turnstile    Turnstile 三种求解方式（API / 浏览器 CDP / 手动）+ 按线路/站点的 Cookie 缓存与后台预热（warmer）

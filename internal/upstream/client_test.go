@@ -297,7 +297,7 @@ func TestSSEDeltaAndDoneEvents(t *testing.T) {
 	}
 }
 
-func TestQuotaSiteCoolsDownAndPrefersSibling(t *testing.T) {
+func TestQuotaFailsOverToSibling(t *testing.T) {
 	cfg := testConfig(t)
 	c := New(cfg, nil, nil, nil)
 	calls := map[string]int{}
@@ -311,32 +311,15 @@ func TestQuotaSiteCoolsDownAndPrefersSibling(t *testing.T) {
 	}
 	emit := func(Event) error { return nil }
 
-	// Round 1: primary reports quota, a sibling serves the request.
+	// Primary reports quota, a sibling serves the request.
 	if err := c.Chat(context.Background(), "deepseek-v4-flash-de", "p", nil, emit); err != nil {
-		t.Fatalf("first Chat: %v", err)
+		t.Fatalf("Chat: %v", err)
 	}
 	if calls["de"] != 1 {
 		t.Fatalf("de calls = %d, want 1", calls["de"])
 	}
 	if calls["es"]+calls["fr"] == 0 {
 		t.Fatal("sibling site was not attempted after primary quota error")
-	}
-
-	// Round 2: de sits on cooldown and must be skipped entirely.
-	delete(calls, "de")
-	delete(calls, "es")
-	delete(calls, "fr")
-	if err := c.Chat(context.Background(), "deepseek-v4-flash-de", "p", nil, emit); err != nil {
-		t.Fatalf("second Chat: %v", err)
-	}
-	if calls["de"] != 0 {
-		t.Fatalf("cooled site hit again: %d calls", calls["de"])
-	}
-	if calls["es"]+calls["fr"] == 0 {
-		t.Fatal("sibling site not used on second round")
-	}
-	if !c.quotaCooled("de") {
-		t.Fatal("de should still be cooling down")
 	}
 }
 
@@ -396,9 +379,6 @@ func TestQuotaRotationRecoversWithoutSolve(t *testing.T) {
 	}
 	if gid == oldGid {
 		t.Fatal("visitor id was not rotated after the quota error")
-	}
-	if c.quotaCooled("de") {
-		t.Error("cooldown should be cleared once the site serves again")
 	}
 }
 
